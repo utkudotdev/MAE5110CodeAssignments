@@ -127,7 +127,7 @@ x^\star + \delta x \rightarrow x^\star + 0.25 \delta x + 0.0625 \delta x \righta
 $$
 The smaller the multiplier is, the less steps through the poincare section we need to converge. Note that this *doesn't* tell us anything about how much *time* it takes to converge.
 
-So the inclination does not change how many steps (literally) the wheel needs to take to approach the final steady state. TODO: why
+So the inclination does not change how many steps (literally) the wheel needs to take to approach the final steady state.
 
 ### Impact of Spoke Count
 
@@ -142,7 +142,10 @@ I simulated spoke counts 6-12. Here are the return maps for the first three at 2
 8 spokes:
 ![spokes_8_attractors.png](./assignment_1_results/spokes_8_attractors.png)
 
-We see a somewhat similar effect to increasing the slope where the stable bands get smaller. One way to see that this is expected is to consider the limit: as we add more and more spokes, we approach the shape of a regular wheel, which we expect to always roll down the slope. TODO: more detailed explanation. And I'm not sure if this wheel analogy holds in light of Floquet multipliers below.
+We see a somewhat similar effect to increasing the slope where the stable bands get smaller. This could be because, with higher spoke counts, the angle between spokes gets smaller. This means two things:
+
+1. The wheel loses less kinetic energy at each step. In the limit, it loses none: $\lim_{\alpha \rightarrow 0} \dot{\theta}_{k + 1} = \lim_{\alpha \rightarrow 0} \dot{\theta}_k \cos(2 \alpha) = \dot{\theta}_k$. This makes it easier to keep spinning.
+2. Intuitively, coming out of a step, the pendulum has to do a lot less swinging against gravity (it needs less kinetic energy to make it over $\theta = 0$ to being with).
 
 We can also see that the bands seem to get closer together as we add more spokes. As we established previously, each band corresponds to some number of steps backwards before settling. It makes sense that wheels with more spokes would take more steps for the same backwards angular velocity.
 
@@ -158,5 +161,4 @@ Now, looking at the Floquet multipliers:
 | 11     | 0.70720165                                |
 | 12     | 0.74901064                                |
 
-The spoke count seems to increase the Floquet multiplier, meaning we take more steps to converge the more spokes we add. A possible explanation for this is that, since each step loses some energy, being forced to take more steps means the rimless wheel pick up speed less quickly.
-
+The spoke count seems to increase the Floquet multiplier, meaning we take more steps to converge the more spokes we add.
