@@ -4,6 +4,8 @@ Implement the model functions for Assignment 2. The visualizer works independent
 of those functions; it draws a supplied state without advancing the simulation.
 """
 
+import jax
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -13,20 +15,54 @@ def generate_params():
 
 
 def dynamics(t, state, params):
-    # TODO: implement the state derivative.
-    return np.array([0.0, 0.0])
+    m = params["mass"]
+    g = params["gravity"]
+    l = params["length"]
+    ankle_torque = params["ankle_torque"]
+    theta, theta_dot = state
+
+    theta_double_dot = (m * g * l * jnp.sin(theta) + ankle_torque) / (m * l**2)
+
+    return jnp.array([theta_dot, theta_double_dot])
 
 
 def event_guard(previous_state, next_state, params):
-    pass
+    alpha = params["angle_of_attack"]
+    gamma = params["incline"]
+    lower_bound = gamma - alpha
+    upper_bound = gamma + alpha
+
+    theta_prev = previous_state[0]
+    theta_next = next_state[0]
+
+    return ((theta_prev < upper_bound) & (theta_next > upper_bound)) | (
+        (theta_prev > lower_bound) & (theta_next < lower_bound)
+    )
 
 
 def event_dynamics(state, params):
-    pass
+    alpha = params["angle_of_attack"]
+    gamma = params["incline"]
+
+    theta, theta_dot = state
+    theta_new = jax.lax.select(theta > gamma + alpha, gamma - alpha, gamma + alpha)
+    theta_dot_new = theta_dot * jnp.cos(2 * alpha)
+
+    return jnp.array([theta_new, theta_dot_new])
 
 
 def calculate_energy(state, params):
-    pass
+    gravity = params["gravity"]
+    mass = params["mass"]
+    length = params["length"]
+
+    theta, theta_dot = state
+
+    inertia = mass * length**2
+    kinetic_energy = 0.5 * inertia * theta_dot**2
+    potential_energy = mass * gravity * length * np.cos(theta)
+
+    return kinetic_energy, potential_energy
 
 
 def visualize(

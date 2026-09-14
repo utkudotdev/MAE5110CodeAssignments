@@ -1,9 +1,13 @@
+import functools as ft
 from pathlib import Path
 
+import jax
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter
 
+from integrators import rk4
 from models import inverted_pendulum_walker as model
 
 # Fixed controls for this visualization example.
@@ -19,29 +23,93 @@ params = {
 initial_state = np.array([0.0, 3.0])
 timestep = 1e-4
 sim_time = 3.0
-desired_number_of_steps = 3
+num_timesteps = round(sim_time / timestep)
 
-n_timesteps = round(sim_time / timestep) + 1
-time_traj = np.arange(n_timesteps) * timestep
-state_traj = np.zeros((2, n_timesteps))
-state_traj[:, 0] = initial_state
-completed_steps = 0
 
-# Simulation loop. Replace this Euler step with your own integrator as needed.
-for step, t in enumerate(time_traj[:-1]):
-    state = state_traj[:, step]
-    next_state = state + timestep * model.dynamics(t, state, params)
+@ft.partial(jax.jit, static_argnames=["num_timesteps"])
+def simulate(initial_state, timestep, num_timesteps, params):
+    """Simulates the systems starting from `initial_state` for `num_timesteps`
+    steps of length `timestep`. Returns `(time_traj, state_traj, impacts)`.
 
-    if model.event_guard(state, next_state, params):
-        next_state = model.event_dynamics(next_state, params)
-        completed_steps += 1
+    `time_traj` is of length `num_timesteps + 1` and indicates the time at which
+    each state in `state_traj` occurred. `state_traj` is of shape (2, `num_timesteps + 1`),
+    one row for theta and another for theta dot. `impacts` is of length `num_timesteps + 1`
+    and indicates timesteps at which the event guard triggered (the corresponding state is
+    *after* the event dynamics have been applied).
+    """
 
-    state_traj[:, step + 1] = next_state
-    if completed_steps == desired_number_of_steps:
-        break
+    def step(carry, _):
+        t, state = carry
 
-time_traj = time_traj[: step + 2]
-state_traj = state_traj[:, : step + 2]
+        f = ft.partial(model.dynamics, params=params)
+        next_state = rk4(f, t, state, timestep)
+
+        event_guard_hit = model.event_guard(state, next_state, params)
+        next_state = jax.lax.cond(
+            event_guard_hit,
+            lambda: model.event_dynamics(next_state, params),
+            lambda: next_state,
+        )
+
+        next_t = t + timestep
+
+        return (next_t, next_state), (next_t, next_state, event_guard_hit)
+
+    _, (time_traj, state_traj, impacts) = jax.lax.scan(
+        step, (0.0, initial_state), length=num_timesteps
+    )
+
+    time_traj = jnp.concatenate([jnp.array([0.0]), time_traj])
+    state_traj = jnp.concatenate([initial_state.reshape((-1, 1)), state_traj.T], axis=1)
+    impacts = jnp.concatenate([jnp.array([False]), impacts])
+
+    return time_traj, state_traj, impacts
+
+
+def calculate_absolute_energy(state_traj, impacts, params):
+    """Return kinetic and potential energy in a fixed global reference frame."""
+    gravity = params["gravity"]
+    mass = params["mass"]
+    length = params["length"]
+    incline = params["incline"]
+    angle_of_attack = params["angle_of_attack"]
+
+    kinetic_energy, potential_energy = model.calculate_energy(state_traj, params)
+    theta = state_traj[0]
+
+    step_height = 2 * length * jnp.sin(angle_of_attack) * jnp.sin(incline)
+    stance_height_changes = jnp.where(
+        impacts,
+        jnp.where(theta < incline, -step_height, step_height),
+        0.0,
+    )
+    stance_height = jnp.cumsum(stance_height_changes)
+    potential_energy = potential_energy + mass * gravity * stance_height
+
+    return kinetic_energy, potential_energy
+
+
+def plot_energy(time_traj, state_traj, impacts, params):
+    kinetic_energy, potential_energy = calculate_absolute_energy(
+        state_traj, impacts, params
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
+    ax.plot(time_traj, kinetic_energy, label="Kinetic energy")
+    ax.plot(time_traj, potential_energy, label="Potential energy")
+    ax.plot(time_traj, kinetic_energy + potential_energy, label="Total energy")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Energy (J)")
+    ax.set_title("Absolute Energy")
+    ax.grid(alpha=0.25)
+    ax.legend()
+
+    return fig
+
+
+time_traj, state_traj, impacts = simulate(
+    initial_state, timestep, num_timesteps, params
+)
 
 fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
 
@@ -65,8 +133,10 @@ animation = FuncAnimation(
 output = Path("output/assignment_2")
 output.mkdir(parents=True, exist_ok=True)
 animation.save(output / "walker.gif", writer=PillowWriter(fps=fps))
+energy_fig = plot_energy(time_traj, state_traj, impacts, params)
+energy_fig.savefig(output / "energy.png")
 
 # To save an MP4 instead, install FFmpeg and use:
 # animation.save(output / "walker.mp4", writer="ffmpeg", fps=fps)
-print(f"Saved {output / 'walker.gif'} ({completed_steps} footstrikes).")
+print(f"Saved {output / 'walker.gif'} and {output / 'energy.png'}.")
 plt.show()
