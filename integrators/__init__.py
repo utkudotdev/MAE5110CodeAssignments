@@ -1,19 +1,30 @@
-from typing import Callable
+from collections.abc import Callable
+from typing import Protocol, Self
+
 import numpy.typing as npt
-import numpy as np
+
+type ContinuousDynamics[TArray] = Callable[[float, TArray], TArray]
+type Integrator[TArray] = Callable[
+    [ContinuousDynamics[TArray], float, npt.NDArray, float], TArray
+]
 
 
-ContinuousDynamics = Callable[[float, npt.NDArray], npt.NDArray]
-Integrator = Callable[[ContinuousDynamics, float, npt.NDArray, float], npt.NDArray]
+class ArrayLike(Protocol):
+    def __add__(self, other: Self, /) -> Self: ...
+    def __mul__(self, other: float, /) -> Self: ...
+    def __rmul__(self, other: float, /) -> Self: ...
+    def __truediv__(self, other: float, /) -> Self: ...
 
 
-def explicit_euler(
-    f: ContinuousDynamics, t: float, state: npt.NDArray, dt: float
-) -> npt.NDArray:
+def explicit_euler[TArray: ArrayLike](
+    f: ContinuousDynamics[TArray], t: float, state: TArray, dt: float
+) -> TArray:
     return state + dt * f(t, state)
 
 
-def rk4(f: ContinuousDynamics, t: float, state: npt.NDArray, dt: float) -> npt.NDArray:
+def rk4[TArray: ArrayLike](
+    f: ContinuousDynamics[TArray], t: float, state: TArray, dt: float
+) -> TArray:
     k1 = f(t, state)
     k2 = f(t + dt / 2, state + k1 * dt / 2)
     k3 = f(t + dt / 2, state + k2 * dt / 2)
