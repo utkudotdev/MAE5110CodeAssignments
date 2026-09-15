@@ -29,15 +29,12 @@ def dynamics(t, state, params):
 def event_guard(previous_state, next_state, params):
     alpha = params["angle_of_attack"]
     gamma = params["incline"]
-    lower_bound = gamma - alpha
-    upper_bound = gamma + alpha
+    max_theta = gamma + alpha  # only alpha > 0 is allowed
 
     theta_prev = previous_state[0]
     theta_next = next_state[0]
 
-    return ((theta_prev < upper_bound) & (theta_next > upper_bound)) | (
-        (theta_prev > lower_bound) & (theta_next < lower_bound)
-    )
+    return (theta_prev < max_theta) & (theta_next >= max_theta)
 
 
 def event_dynamics(state, params):
