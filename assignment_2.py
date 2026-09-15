@@ -18,12 +18,34 @@ params = {
     "incline": 0.06,  # rad
     "angle_of_attack": np.pi / 8,  # rad
     "ankle_torque": 0.0,  # N m
+    "ankle_torque_damping": 5.0,
 }
 
-initial_state = np.array([0.0, 3.0])
+initial_state = np.array([0.0, 1.0])
 timestep = 1e-4
 sim_time = 3.0
 num_timesteps = round(sim_time / timestep)
+
+
+def ankle_torque_bounds(params):
+    m = params["mass"]
+    g = params["gravity"]
+    l = params["length"]
+    return -0.1 * m * g * l, 0.05 * m * g * l
+
+
+def compute_ankle_torque(state, params):
+    m = params["mass"]
+    g = params["gravity"]
+    l = params["length"]
+    b = params["ankle_torque_damping"]
+    theta, theta_dot = state
+
+    control = -2.0 * m * g * l * jnp.sin(theta) - b * theta_dot
+    lower, upper = ankle_torque_bounds(params)
+    clipped = jnp.clip(control, lower, upper)
+
+    return clipped
 
 
 @ft.partial(jax.jit, static_argnames=["num_timesteps"])
@@ -40,6 +62,9 @@ def simulate(initial_state, timestep, num_timesteps, params):
 
     def step(carry, _):
         t, state = carry
+
+        ankle_torque = compute_ankle_torque(state, params)
+        params["ankle_torque"] = ankle_torque
 
         f = ft.partial(model.dynamics, params=params)
         next_state = rk4(f, t, state, timestep)
