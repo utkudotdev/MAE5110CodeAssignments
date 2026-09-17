@@ -50,6 +50,23 @@ def compute_ankle_torque(state, params):
     return clipped
 
 
+def get_timestep_for_state(state, params, large_timestep, small_timestep):
+    alpha = params["angle_of_attack"]
+    gamma = params["incline"]
+    upper_limit = gamma + alpha
+    lower_limit = jnp.deg2rad(-90.0) + gamma
+    total_range = upper_limit - lower_limit
+
+    theta, theta_dot = state
+    distance = jnp.where(
+        theta_dot >= 0,
+        upper_limit - theta,
+        theta - lower_limit,
+    )
+    progress = (total_range - distance) / total_range
+    return progress * small_timestep + (1 - progress) * large_timestep
+
+
 @ft.partial(jax.jit, static_argnames=["num_timesteps"])
 def simulate(initial_state, timestep, num_timesteps, params):
     """Simulates the systems starting from `initial_state` for `num_timesteps`
@@ -129,7 +146,7 @@ def plot_energy(time_traj, state_traj, impacts, params):
 
 
 @jax.jit
-def find_upright_roa(params, timestep, max_steps):
+def find_upright_roa(params, large_timestep, small_timestep, sim_time):
     gamma = params["incline"]
     alpha = params["angle_of_attack"]
 
@@ -146,8 +163,12 @@ def find_upright_roa(params, timestep, max_steps):
     )
     flat_initial_states = all_initial_states.reshape((-1, 2))
 
-    stable = jax.vmap(can_stabilize, in_axes=(0, None, None, None))(
-        flat_initial_states, params, timestep, max_steps
+    stable = jax.vmap(can_stabilize, in_axes=(0, None, None, None, None))(
+        flat_initial_states,
+        params,
+        large_timestep,
+        small_timestep,
+        sim_time,
     )
     classification_grid = stable.reshape((NUM_THETAS, NUM_THETA_DOTS)).astype(int)
 
@@ -202,7 +223,9 @@ def plot_upright_roa(result: RoAResult):
     return fig
 
 
-def can_stabilize(initial_state, params, timestep, max_steps) -> jax.Array:
+def can_stabilize(
+    initial_state, params, large_timestep, small_timestep, sim_time
+) -> jax.Array:
     def wrap_angle(theta):
         return jnp.abs((theta + jnp.pi) % (2 * jnp.pi) - jnp.pi)
 
@@ -217,14 +240,16 @@ def can_stabilize(initial_state, params, timestep, max_steps) -> jax.Array:
         )
 
     def step(val):
-        state, step, _, _ = val
-        t = timestep * step
+        state, time, _, _ = val
+
+        timestep = get_timestep_for_state(state, params, large_timestep, small_timestep)
+        timestep = jnp.minimum(timestep, sim_time - time)
 
         ankle_torque = compute_ankle_torque(state, params)
         controlled_params = {**params, "ankle_torque": ankle_torque}
 
         f = ft.partial(model.dynamics, params=controlled_params)
-        next_state = rk4(f, t, state, timestep)
+        next_state = rk4(f, time, state, timestep)
 
         collision_type = model.event_guard(state, next_state, controlled_params)
         next_state = jax.lax.cond(
@@ -235,12 +260,20 @@ def can_stabilize(initial_state, params, timestep, max_steps) -> jax.Array:
 
         stable = stabilized(next_state)
         collision_occurred = collision_type != model.NO_COLLISION
-        done = fell_over(next_state) | stable | collision_occurred | (step >= max_steps)
+        next_time = time + timestep
+        done = (
+            fell_over(next_state)
+            | stable
+            | collision_occurred
+            | (next_time >= sim_time)
+        )
 
-        return (next_state, step + 1, stable, done)
+        return next_state, next_time, stable, done
 
     _, _, stable, _ = jax.lax.while_loop(
-        lambda t: ~t[3], step, (initial_state, 0, jnp.array(False), jnp.array(False))
+        lambda t: ~t[3],
+        step,
+        (initial_state, 0.0, jnp.array(False), jnp.array(False)),
     )
 
     return stable
@@ -306,7 +339,9 @@ def main():
         energy_fig.savefig(output / "energy.png")
         print(f"Saved {output / 'walker.gif'} and {output / 'energy.png'}.")
     elif args.command == "roa":
-        roa_result = find_upright_roa(params, timestep, num_timesteps)
+        large_timestep = 1e-3
+        small_timestep = 1e-4
+        roa_result = find_upright_roa(params, large_timestep, small_timestep, sim_time)
         roa_fig = plot_upright_roa(roa_result)
         roa_fig.savefig(output / "upright_roa.png")
         print(f"Saved {output / 'upright_roa.png'}.")
