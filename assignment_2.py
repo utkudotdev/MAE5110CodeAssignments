@@ -38,6 +38,12 @@ class ReturnMapResult:
     next_theta_dot_grid: jax.Array
 
 
+@dataclass
+class StepsToStabilityResult:
+    theta_dot_values: np.ndarray
+    steps: np.ndarray
+
+
 def compute_ankle_torque(state, params):
     m = params["mass"]
     g = params["gravity"]
@@ -183,20 +189,11 @@ def plot_energy(time_traj, state_traj, impacts, params):
 
 
 @jax.jit
-def find_upright_roa(params, large_timestep, small_timestep, sim_time):
-    gamma = params["incline"]
-    alpha = params["angle_of_attack"]
-
-    THETA_MIN, THETA_MAX = jnp.deg2rad(-90.0) + gamma, gamma + alpha
-    NUM_THETAS = 200
-    THETA_DOT_MIN, THETA_DOT_MAX = jnp.deg2rad(-100.0), jnp.deg2rad(300.0)
-    NUM_THETA_DOTS = 200
-
-    thetas = jnp.linspace(THETA_MIN, THETA_MAX, NUM_THETAS)
-    theta_dots = jnp.linspace(THETA_DOT_MIN, THETA_DOT_MAX, NUM_THETA_DOTS)
-
+def find_upright_roa(
+    params, theta_values, theta_dot_values, large_timestep, small_timestep, sim_time
+):
     all_initial_states = jnp.stack(
-        jnp.meshgrid(thetas, theta_dots, indexing="ij"), axis=-1
+        jnp.meshgrid(theta_values, theta_dot_values, indexing="ij"), axis=-1
     )
     flat_initial_states = all_initial_states.reshape((-1, 2))
 
@@ -207,11 +204,13 @@ def find_upright_roa(params, large_timestep, small_timestep, sim_time):
         small_timestep,
         sim_time,
     )
-    classification_grid = stable.reshape((NUM_THETAS, NUM_THETA_DOTS)).astype(int)
+    classification_grid = stable.reshape(
+        (theta_values.size, theta_dot_values.size)
+    ).astype(int)
 
     return RoAResult(
-        theta_values=thetas,
-        theta_dot_values=theta_dots,
+        theta_values=theta_values,
+        theta_dot_values=theta_dot_values,
         classification_grid=classification_grid,
     )
 
@@ -349,19 +348,15 @@ def get_next_poincare_velocity(
 
 
 @jax.jit
-def compute_return_map(params, large_timestep, small_timestep, max_sim_time):
+def compute_return_map(
+    params,
+    theta_dot_values,
+    alpha_values,
+    large_timestep,
+    small_timestep,
+    max_sim_time,
+):
     """Sweep the theta=0 Poincare return map over theta dot and alpha."""
-    NUM_ALPHAS = 20
-    NUM_THETA_DOTS = 200
-    MAX_FROUDE = 2.0
-
-    alpha_min, alpha_max = params["angle_of_attack_bounds"]
-    alpha_values = jnp.linspace(alpha_min, alpha_max, NUM_ALPHAS)
-    theta_dot_values = jnp.linspace(
-        0.0,
-        jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
-        NUM_THETA_DOTS,
-    )
     theta_dot_grid, alpha_grid = jnp.meshgrid(
         theta_dot_values, alpha_values, indexing="xy"
     )
@@ -381,7 +376,9 @@ def compute_return_map(params, large_timestep, small_timestep, max_sim_time):
     return ReturnMapResult(
         alpha_values=alpha_values,
         theta_dot_values=theta_dot_values,
-        next_theta_dot_grid=next_theta_dots.reshape((NUM_ALPHAS, NUM_THETA_DOTS)),
+        next_theta_dot_grid=next_theta_dots.reshape(
+            (alpha_values.size, theta_dot_values.size)
+        ),
     )
 
 
@@ -419,6 +416,99 @@ def plot_return_map(result: ReturnMapResult):
     ax.set_ylabel(r"Next velocity $\dot{\theta}_{k+1}$ (deg/s)")
     ax.grid(alpha=0.25)
     ax.legend()
+
+    return fig
+
+
+def compute_steps_to_stability(
+    roa_result: RoAResult,
+    return_map_result: ReturnMapResult,
+    state_match_tolerance,
+) -> StepsToStabilityResult:
+    """Find the minimum number of footsteps needed to enter the upright RoA."""
+    theta_values = np.asarray(roa_result.theta_values)
+    theta_dot_values = np.asarray(return_map_result.theta_dot_values)
+    roa_theta_dot_values = np.asarray(roa_result.theta_dot_values)
+    if not np.array_equal(theta_dot_values, roa_theta_dot_values):
+        raise ValueError("RoA and return map must use the same theta-dot grid.")
+
+    poincare_index = np.argmin(np.abs(theta_values))
+    if not np.isclose(theta_values[poincare_index], 0.0):
+        raise ValueError("The RoA theta grid must contain theta=0.")
+
+    steps = np.full(theta_dot_values.shape, -1, dtype=int)
+    in_upright_roa = (
+        np.asarray(roa_result.classification_grid[poincare_index])
+        == RoAClassification.STABILIZABLE
+    )
+    steps[in_upright_roa] = 0
+
+    next_theta_dot_grid = np.asarray(return_map_result.next_theta_dot_grid)
+    next_step_count = 1
+    while True:
+        unmarked_indices = np.flatnonzero(steps < 0)
+        marked_velocities = theta_dot_values[steps >= 0]
+        if not unmarked_indices.size or not marked_velocities.size:
+            break
+
+        candidate_next_states = next_theta_dot_grid[:, unmarked_indices]
+        close_to_marked = (
+            np.abs(candidate_next_states[:, :, None] - marked_velocities[None, None, :])
+            <= state_match_tolerance
+        )
+        newly_reachable = np.any(close_to_marked, axis=(0, 2))
+        if not np.any(newly_reachable):
+            break
+
+        steps[unmarked_indices[newly_reachable]] = next_step_count
+        next_step_count += 1
+
+    return StepsToStabilityResult(
+        theta_dot_values=theta_dot_values,
+        steps=steps,
+    )
+
+
+def plot_steps_to_stability(result: StepsToStabilityResult):
+    max_steps = max(0, np.max(result.steps))
+    step_colors = plt.get_cmap("viridis")(np.linspace(0.15, 0.95, max_steps + 1))
+    color_map = ListedColormap(["#6c757d", *step_colors])
+    color_norm = BoundaryNorm(
+        np.arange(max_steps + 3) - 0.5,
+        color_map.N,
+    )
+
+    plot_values = np.where(result.steps < 0, 0, result.steps + 1)
+    plot_grid = np.repeat(plot_values[None, :], 2, axis=0)
+
+    fig, ax = plt.subplots(figsize=(8, 2.5), layout="constrained")
+    ax.pcolormesh(
+        np.rad2deg(result.theta_dot_values),
+        np.array([0.0, 1.0]),
+        plot_grid,
+        cmap=color_map,
+        norm=color_norm,
+        shading="nearest",
+    )
+
+    legend_handles = [Patch(color="#6c757d", label="Unreachable")]
+    legend_handles.extend(
+        Patch(
+            color=step_colors[steps],
+            label=f"{steps} step" if steps == 1 else f"{steps} steps",
+        )
+        for steps in range(max_steps + 1)
+        if np.any(result.steps == steps)
+    )
+    ax.legend(
+        handles=legend_handles,
+        title="Steps to stability",
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+    )
+    ax.set_yticks([])
+    ax.set_title(r"Steps to Reach the Upright RoA from $\theta=0$")
+    ax.set_xlabel(r"Initial velocity $\dot{\theta}_k$ (deg/s)")
 
     return fig
 
@@ -496,6 +586,9 @@ def main():
         "roa", help="plot the upright controller's region of attraction"
     )
     subparsers.add_parser("return-map", help="plot the theta=0 Poincare return map")
+    subparsers.add_parser(
+        "lookup-table", help="compute minimum steps from the return map to the RoA"
+    )
     args = parser.parse_args()
 
     params = {
@@ -536,12 +629,27 @@ def main():
         energy_fig.savefig(output / "energy.png")
         print(f"Saved {output / 'walker.gif'} and {output / 'energy.png'}.")
     elif args.command == "roa":
+        NUM_THETAS = 200
+        NUM_THETA_DOTS = 200
+        THETA_MIN = np.deg2rad(-90.0) + params["incline"]
+        THETA_MAX = params["incline"] + params["angle_of_attack"]
+        THETA_DOT_MIN = np.deg2rad(-100.0)
+        THETA_DOT_MAX = np.deg2rad(300.0)
         sim_time = 10.0
         large_timestep = 1e-2
         small_timestep = 1e-4
+        theta_values = jnp.linspace(THETA_MIN, THETA_MAX, NUM_THETAS)
+        theta_dot_values = jnp.linspace(THETA_DOT_MIN, THETA_DOT_MAX, NUM_THETA_DOTS)
 
         start = time.perf_counter()
-        roa_result = find_upright_roa(params, large_timestep, small_timestep, sim_time)
+        roa_result = find_upright_roa(
+            params,
+            theta_values,
+            theta_dot_values,
+            large_timestep,
+            small_timestep,
+            sim_time,
+        )
         jax.block_until_ready(roa_result)
         end = time.perf_counter()
         print(f"Computed RoA in {end - start}s")
@@ -550,13 +658,24 @@ def main():
         roa_fig.savefig(output / "upright_roa.png")
         print(f"Saved {output / 'upright_roa.png'}.")
     elif args.command == "return-map":
+        NUM_ALPHAS = 20
+        NUM_THETA_DOTS = 200
+        MAX_FROUDE = 2.0
         sim_time = 5.0
         large_timestep = 1e-2
         small_timestep = 1e-4
+        alpha_values = jnp.linspace(*params["angle_of_attack_bounds"], NUM_ALPHAS)
+        theta_dot_values = jnp.linspace(
+            0.0,
+            jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
+            NUM_THETA_DOTS,
+        )
 
         start = time.perf_counter()
         return_map = compute_return_map(
             params,
+            theta_dot_values,
+            alpha_values,
             large_timestep,
             small_timestep,
             sim_time,
@@ -568,6 +687,58 @@ def main():
         return_map_fig = plot_return_map(return_map)
         return_map_fig.savefig(output / "return_map.png")
         print(f"Saved {output / 'return_map.png'}.")
+    elif args.command == "lookup-table":
+        NUM_THETA_DOTS = 200
+        NUM_ALPHAS = 20
+        MAX_FROUDE = 2.0
+        ROA_SIM_TIME = 10.0
+        RETURN_MAP_SIM_TIME = 5.0
+        LARGE_TIMESTEP = 1e-2
+        SMALL_TIMESTEP = 1e-4
+
+        theta_values = jnp.array([0.0])
+        theta_dot_values = jnp.linspace(
+            0.0,
+            jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
+            NUM_THETA_DOTS,
+        )
+        alpha_values = jnp.linspace(*params["angle_of_attack_bounds"], NUM_ALPHAS)
+        STATE_MATCH_TOLERANCE = float((theta_dot_values[1] - theta_dot_values[0]) / 2)
+
+        start = time.perf_counter()
+        roa_result = find_upright_roa(
+            params,
+            theta_values,
+            theta_dot_values,
+            LARGE_TIMESTEP,
+            SMALL_TIMESTEP,
+            ROA_SIM_TIME,
+        )
+        return_map = compute_return_map(
+            params,
+            theta_dot_values,
+            alpha_values,
+            LARGE_TIMESTEP,
+            SMALL_TIMESTEP,
+            RETURN_MAP_SIM_TIME,
+        )
+        jax.block_until_ready((roa_result, return_map))
+        steps_result = compute_steps_to_stability(
+            roa_result,
+            return_map,
+            STATE_MATCH_TOLERANCE,
+        )
+        end = time.perf_counter()
+        print(f"Computed lookup table in {end - start}s")
+        print(
+            f"Reachable states: {np.count_nonzero(steps_result.steps >= 0)}/"
+            f"{steps_result.steps.size}; maximum steps: {np.max(steps_result.steps)}"
+        )
+
+        steps_fig = plot_steps_to_stability(steps_result)
+        steps_path = output / "steps_to_stability.png"
+        steps_fig.savefig(steps_path)
+        print(f"Saved {steps_path}.")
 
     plt.show()
 
