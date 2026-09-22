@@ -4,14 +4,9 @@ Implement the model functions for Assignment 2. The visualizer works independent
 of those functions; it draws a supplied state without advancing the simulation.
 """
 
-import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-
-BACKWARD_COLLISION = -1
-NO_COLLISION = 0
-FORWARD_COLLISION = 1
 
 
 def generate_params():
@@ -34,37 +29,21 @@ def event_guard(previous_state, next_state, params):
     alpha = params["angle_of_attack"]
     gamma = params["incline"]
 
-    min_theta = jnp.deg2rad(-90.0) + gamma
     max_theta = gamma + alpha  # only alpha > 0 is allowed
 
     theta_prev = previous_state[0]
     theta_next = next_state[0]
 
-    forward_collision = (theta_prev <= max_theta) & (theta_next >= max_theta)
-    backward_collision = (theta_prev >= min_theta) & (theta_next <= min_theta)
-
-    return jnp.where(
-        forward_collision,
-        FORWARD_COLLISION,
-        jnp.where(backward_collision, BACKWARD_COLLISION, NO_COLLISION),
-    )
+    return (theta_prev <= max_theta) & (theta_next >= max_theta)
 
 
-def event_dynamics(state, collision_type, params):
+def event_dynamics(state, params):
     alpha = params["angle_of_attack"]
     gamma = params["incline"]
 
     _, theta_dot = state
-    forward_collision = collision_type == FORWARD_COLLISION
-    theta_new = jax.lax.select(
-        forward_collision, gamma - alpha, jnp.deg2rad(-90.0) + gamma
-    )
-
-    # doesn't really matter what we do for backwards collision, it should always end trajectory.
-    # technically this just removes a bunch of energy but it's kinda whatever atp
-    theta_dot_new = jax.lax.select(
-        forward_collision, theta_dot * jnp.cos(2 * alpha), 0.0
-    )
+    theta_new = gamma - alpha
+    theta_dot_new = theta_dot * jnp.cos(2 * alpha)
 
     return jnp.array([theta_new, theta_dot_new])
 

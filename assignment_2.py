@@ -1,6 +1,7 @@
 import argparse
 import enum
 import functools as ft
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,54 +51,83 @@ def compute_ankle_torque(state, params):
     return clipped
 
 
-def get_timestep_for_state(state, params, large_timestep, small_timestep):
-    alpha = params["angle_of_attack"]
-    gamma = params["incline"]
-    upper_limit = gamma + alpha
-    lower_limit = jnp.deg2rad(-90.0) + gamma
-    total_range = upper_limit - lower_limit
+def simulation_step(time, state, timestep, small_timestep, params):
+    """Advance by ``timestep``, using ``small_timestep`` near an impact.
 
-    theta, theta_dot = state
-    distance = jnp.where(
-        theta_dot >= 0,
-        upper_limit - theta,
-        theta - lower_limit,
+    The inexpensive full-size integration is retained when it does not cross an
+    event guard. If it does, the step is replayed with `small_timestep` through
+    the impact, event dynamics are applied, and the remainder of the original
+    timestep is integrated. Thus the returned state is always at
+    ``time + timestep``.
+
+    At most one impact is supported within a timestep.
+    """
+    ankle_torque = compute_ankle_torque(state, params)
+    controlled_params = {**params, "ankle_torque": ankle_torque}
+    dynamics = ft.partial(model.dynamics, params=controlled_params)
+
+    full_step_state = rk4(dynamics, time, state, timestep)
+    full_step_collision = model.event_guard(state, full_step_state, controlled_params)
+
+    def refine_collision():
+        def searching_for_impact(carry):
+            _, elapsed, collision_occurred = carry
+            return (elapsed < timestep) & ~collision_occurred
+
+        def take_small_step(carry):
+            current_state, elapsed, _ = carry
+            step_size = jnp.minimum(small_timestep, timestep - elapsed)
+            next_state = rk4(dynamics, time + elapsed, current_state, step_size)
+            collision_occurred = model.event_guard(
+                current_state, next_state, controlled_params
+            )
+            next_state = jax.lax.cond(
+                collision_occurred,
+                lambda: model.event_dynamics(next_state, controlled_params),
+                lambda: next_state,
+            )
+            return next_state, elapsed + step_size, collision_occurred
+
+        impact_state, elapsed, collision_occurred = jax.lax.while_loop(
+            searching_for_impact,
+            take_small_step,
+            (state, jnp.asarray(0.0), jnp.asarray(False)),
+        )
+
+        remaining_time = timestep - elapsed
+        end_state = rk4(dynamics, time + elapsed, impact_state, remaining_time)
+        return end_state, collision_occurred
+
+    return jax.lax.cond(
+        full_step_collision,
+        refine_collision,
+        lambda: (full_step_state, full_step_collision),
     )
-    progress = (total_range - distance) / total_range
-    return progress * small_timestep + (1 - progress) * large_timestep
 
 
 @ft.partial(jax.jit, static_argnames=["num_timesteps"])
-def simulate(initial_state, timestep, num_timesteps, params):
+def simulate(initial_state, timestep, small_timestep, num_timesteps, params):
     """Simulates the systems starting from `initial_state` for `num_timesteps`
     steps of length `timestep`. Returns `(time_traj, state_traj, impacts)`.
 
     `time_traj` is of length `num_timesteps + 1` and indicates the time at which
     each state in `state_traj` occurred. `state_traj` is of shape (2, `num_timesteps + 1`),
     one row for theta and another for theta dot. `impacts` is of length `num_timesteps + 1`
-    and contains the collision type at each timestep: -1 for backward, 0 for none,
-    and 1 for forward. A state at an impact is recorded *after* event dynamics.
+    and is true when a forward impact occurred during that timestep. When an
+    impact occurs, the corresponding state is recorded at the end of the
+    timestep, after event dynamics and the remaining integration.
     """
 
     def step(carry, _):
         t, state = carry
 
-        ankle_torque = compute_ankle_torque(state, params)
-        params["ankle_torque"] = ankle_torque
-
-        f = ft.partial(model.dynamics, params=params)
-        next_state = rk4(f, t, state, timestep)
-
-        collision_type = model.event_guard(state, next_state, params)
-        next_state = jax.lax.cond(
-            collision_type != model.NO_COLLISION,
-            lambda: model.event_dynamics(next_state, collision_type, params),
-            lambda: next_state,
+        next_state, collision_occurred = simulation_step(
+            t, state, timestep, small_timestep, params
         )
 
         next_t = t + timestep
 
-        return (next_t, next_state), (next_t, next_state, collision_type)
+        return (next_t, next_state), (next_t, next_state, collision_occurred)
 
     _, (time_traj, state_traj, impacts) = jax.lax.scan(
         step, (0.0, initial_state), length=num_timesteps
@@ -105,7 +135,7 @@ def simulate(initial_state, timestep, num_timesteps, params):
 
     time_traj = jnp.concatenate([jnp.array([0.0]), time_traj])
     state_traj = jnp.concatenate([initial_state.reshape((-1, 1)), state_traj.T], axis=1)
-    impacts = jnp.concatenate([jnp.array([model.NO_COLLISION]), impacts])
+    impacts = jnp.concatenate([jnp.array([False]), impacts])
 
     return time_traj, state_traj, impacts
 
@@ -120,7 +150,7 @@ def calculate_absolute_energy(state_traj, impacts, params):
 
     kinetic_energy, potential_energy = model.calculate_energy(state_traj, params)
     step_height = 2 * length * jnp.sin(angle_of_attack) * jnp.sin(incline)
-    stance_height_changes = (impacts == model.FORWARD_COLLISION) * step_height
+    stance_height_changes = impacts * step_height
     stance_height = jnp.cumsum(stance_height_changes)
     potential_energy = potential_energy + mass * gravity * stance_height
 
@@ -242,24 +272,12 @@ def can_stabilize(
     def step(val):
         state, time, _, _ = val
 
-        timestep = get_timestep_for_state(state, params, large_timestep, small_timestep)
-        timestep = jnp.minimum(timestep, sim_time - time)
-
-        ankle_torque = compute_ankle_torque(state, params)
-        controlled_params = {**params, "ankle_torque": ankle_torque}
-
-        f = ft.partial(model.dynamics, params=controlled_params)
-        next_state = rk4(f, time, state, timestep)
-
-        collision_type = model.event_guard(state, next_state, controlled_params)
-        next_state = jax.lax.cond(
-            collision_type != model.NO_COLLISION,
-            lambda: model.event_dynamics(next_state, collision_type, controlled_params),
-            lambda: next_state,
+        timestep = jnp.minimum(large_timestep, sim_time - time)
+        next_state, collision_occurred = simulation_step(
+            time, state, timestep, small_timestep, params
         )
 
         stable = stabilized(next_state)
-        collision_occurred = collision_type != model.NO_COLLISION
         next_time = time + timestep
         done = (
             fell_over(next_state)
@@ -318,17 +336,23 @@ def main():
         "ankle_torque": 0.0,  # N m
         "ankle_torque_damping": 5.0,
     }
-    timestep = 1e-4
-    sim_time = 10.0
-    num_timesteps = round(sim_time / timestep)
     output = Path("output/assignment_2")
     output.mkdir(parents=True, exist_ok=True)
 
     if args.command == "trajectory":
-        initial_state = np.array([jnp.deg2rad(-90.0) + params["incline"], 0.0])
+        sim_time = 3.0
+        timestep = 1e-3
+        small_timestep = 1e-4
+        num_timesteps = round(sim_time / timestep)
+        initial_state = np.array([params["incline"], 2.0])
+
+        start = time.perf_counter()
         time_traj, state_traj, impacts = simulate(
-            initial_state, timestep, num_timesteps, params
+            initial_state, timestep, small_timestep, num_timesteps, params
         )
+        jax.block_until_ready((time_traj, state_traj, impacts))
+        end = time.perf_counter()
+        print(f"Computed trajectory in {end - start}s")
 
         fps = 25
         animation = create_walker_animation(
@@ -339,9 +363,16 @@ def main():
         energy_fig.savefig(output / "energy.png")
         print(f"Saved {output / 'walker.gif'} and {output / 'energy.png'}.")
     elif args.command == "roa":
-        large_timestep = 1e-3
+        sim_time = 10.0
+        large_timestep = 1e-2
         small_timestep = 1e-4
+
+        start = time.perf_counter()
         roa_result = find_upright_roa(params, large_timestep, small_timestep, sim_time)
+        jax.block_until_ready(roa_result)
+        end = time.perf_counter()
+        print(f"Computed RoA in {end - start}s")
+
         roa_fig = plot_upright_roa(roa_result)
         roa_fig.savefig(output / "upright_roa.png")
         print(f"Saved {output / 'upright_roa.png'}.")
