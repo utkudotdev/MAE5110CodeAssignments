@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter
-from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.colors import BoundaryNorm, ListedColormap, Normalize
 from matplotlib.patches import Patch
 
 from integrators import rk4
@@ -30,11 +30,12 @@ class RoAResult:
     classification_grid: jax.Array
 
 
-def ankle_torque_bounds(params):
-    m = params["mass"]
-    g = params["gravity"]
-    l = params["length"]
-    return -0.1 * m * g * l, 0.05 * m * g * l
+@jax.tree_util.register_dataclass
+@dataclass
+class ReturnMapResult:
+    alpha_values: jax.Array
+    theta_dot_values: jax.Array
+    next_theta_dot_grid: jax.Array
 
 
 def compute_ankle_torque(state, params):
@@ -45,13 +46,15 @@ def compute_ankle_torque(state, params):
     theta, theta_dot = state
 
     control = -2.0 * m * g * l * jnp.sin(theta) - b * theta_dot
-    lower, upper = ankle_torque_bounds(params)
+    lower, upper = params["ankle_torque_bounds"]
     clipped = jnp.clip(control, lower, upper)
 
     return clipped
 
 
-def simulation_step(time, state, timestep, small_timestep, params):
+def simulation_step(
+    time, state, timestep, small_timestep, params, use_ankle_controller=True
+):
     """Advance by ``timestep``, using ``small_timestep`` near an impact.
 
     The inexpensive full-size integration is retained when it does not cross an
@@ -62,7 +65,11 @@ def simulation_step(time, state, timestep, small_timestep, params):
 
     At most one impact is supported within a timestep.
     """
-    ankle_torque = compute_ankle_torque(state, params)
+    ankle_torque = jnp.where(
+        use_ankle_controller,
+        compute_ankle_torque(state, params),
+        0.0,
+    )
     controlled_params = {**params, "ankle_torque": ankle_torque}
     dynamics = ft.partial(model.dynamics, params=controlled_params)
 
@@ -253,6 +260,169 @@ def plot_upright_roa(result: RoAResult):
     return fig
 
 
+def get_next_poincare_velocity(
+    theta_dot,
+    alpha,
+    params,
+    large_timestep,
+    small_timestep,
+    max_sim_time,
+):
+    """Return theta dot at the next positive crossing of the theta=0 section."""
+    POINCARE_THETA = 0.0
+    FALL_ANGLE = jnp.deg2rad(-89.0)
+
+    return_map_params = {
+        **params,
+        "angle_of_attack": alpha,
+        "ankle_torque": jnp.asarray(0.0),
+    }
+    dynamics = ft.partial(model.dynamics, params=return_map_params)
+
+    def refine_section_crossing(time, state, timestep):
+        def before_section(carry):
+            current_state, elapsed = carry
+            return (elapsed < timestep) & (current_state[0] < POINCARE_THETA)
+
+        def take_small_step(carry):
+            current_state, elapsed = carry
+            step_size = jnp.minimum(small_timestep, timestep - elapsed)
+            next_state = rk4(dynamics, time + elapsed, current_state, step_size)
+            return next_state, elapsed + step_size
+
+        crossing_state, _ = jax.lax.while_loop(
+            before_section,
+            take_small_step,
+            (state, jnp.asarray(0.0)),
+        )
+        return crossing_state
+
+    def continue_simulation(carry):
+        _, time, _, section_crossed, fell_backward = carry
+        return ~section_crossed & ~fell_backward & (time < max_sim_time)
+
+    def take_step(carry):
+        state, time, impact_occurred, _, _ = carry
+        timestep = jnp.minimum(large_timestep, max_sim_time - time)
+        next_state, impact_this_step = simulation_step(
+            time,
+            state,
+            timestep,
+            small_timestep,
+            return_map_params,
+            use_ankle_controller=False,
+        )
+
+        section_crossed = (
+            impact_occurred
+            & (state[0] <= POINCARE_THETA)
+            & (next_state[0] >= POINCARE_THETA)
+        )
+        next_state = jax.lax.cond(
+            section_crossed,
+            lambda: refine_section_crossing(time, state, timestep),
+            lambda: next_state,
+        )
+        fell_backward = next_state[0] < FALL_ANGLE
+
+        return (
+            next_state,
+            time + timestep,
+            impact_occurred | impact_this_step,
+            section_crossed,
+            fell_backward,
+        )
+
+    final_state, _, _, section_crossed, _ = jax.lax.while_loop(
+        continue_simulation,
+        take_step,
+        (
+            jnp.array([POINCARE_THETA, theta_dot]),
+            jnp.asarray(0.0),
+            jnp.asarray(False),
+            jnp.asarray(False),
+            jnp.asarray(False),
+        ),
+    )
+
+    return jnp.where(section_crossed, final_state[1], jnp.nan)
+
+
+@jax.jit
+def compute_return_map(params, large_timestep, small_timestep, max_sim_time):
+    """Sweep the theta=0 Poincare return map over theta dot and alpha."""
+    NUM_ALPHAS = 20
+    NUM_THETA_DOTS = 200
+    MAX_FROUDE = 2.0
+
+    alpha_min, alpha_max = params["angle_of_attack_bounds"]
+    alpha_values = jnp.linspace(alpha_min, alpha_max, NUM_ALPHAS)
+    theta_dot_values = jnp.linspace(
+        0.0,
+        jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
+        NUM_THETA_DOTS,
+    )
+    theta_dot_grid, alpha_grid = jnp.meshgrid(
+        theta_dot_values, alpha_values, indexing="xy"
+    )
+
+    next_theta_dots = jax.vmap(
+        get_next_poincare_velocity,
+        in_axes=(0, 0, None, None, None, None),
+    )(
+        theta_dot_grid.ravel(),
+        alpha_grid.ravel(),
+        params,
+        large_timestep,
+        small_timestep,
+        max_sim_time,
+    )
+
+    return ReturnMapResult(
+        alpha_values=alpha_values,
+        theta_dot_values=theta_dot_values,
+        next_theta_dot_grid=next_theta_dots.reshape((NUM_ALPHAS, NUM_THETA_DOTS)),
+    )
+
+
+def plot_return_map(result: ReturnMapResult):
+    fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
+    color_map = plt.get_cmap("viridis")
+    color_norm = Normalize(
+        vmin=np.rad2deg(result.alpha_values[0]),
+        vmax=np.rad2deg(result.alpha_values[-1]),
+    )
+
+    theta_dot_values = np.rad2deg(result.theta_dot_values)
+    for alpha, next_theta_dots in zip(result.alpha_values, result.next_theta_dot_grid):
+        alpha_degrees = np.rad2deg(alpha)
+        ax.plot(
+            theta_dot_values,
+            np.rad2deg(next_theta_dots),
+            color=color_map(color_norm(alpha_degrees)),
+            linewidth=1.5,
+        )
+
+    velocity_max = np.nanmax(
+        [np.max(theta_dot_values), np.nanmax(np.rad2deg(result.next_theta_dot_grid))]
+    )
+    ax.plot([0.0, velocity_max], [0.0, velocity_max], "k--", label="Identity")
+    fig.colorbar(
+        plt.cm.ScalarMappable(norm=color_norm, cmap=color_map),
+        ax=ax,
+        label=r"Angle of attack $\alpha$ (deg)",
+    )
+    ax.set_xlim(0.0, velocity_max)
+    ax.set_ylim(0.0, velocity_max)
+    ax.set_title(r"Walker Return Map on $\theta=0$")
+    ax.set_xlabel(r"Current velocity $\dot{\theta}_k$ (deg/s)")
+    ax.set_ylabel(r"Next velocity $\dot{\theta}_{k+1}$ (deg/s)")
+    ax.grid(alpha=0.25)
+    ax.legend()
+
+    return fig
+
+
 def can_stabilize(
     initial_state, params, large_timestep, small_timestep, sim_time
 ) -> jax.Array:
@@ -325,6 +495,7 @@ def main():
     subparsers.add_parser(
         "roa", help="plot the upright controller's region of attraction"
     )
+    subparsers.add_parser("return-map", help="plot the theta=0 Poincare return map")
     args = parser.parse_args()
 
     params = {
@@ -333,7 +504,9 @@ def main():
         "mass": 1.0,  # kg
         "incline": 0.06,  # rad
         "angle_of_attack": np.pi / 8,  # rad
+        "angle_of_attack_bounds": np.array([np.pi / 8, np.pi / 7]),  # rad
         "ankle_torque": 0.0,  # N m
+        "ankle_torque_bounds": np.array([-0.1 * 9.81, 0.05 * 9.81]),  # N m
         "ankle_torque_damping": 5.0,
     }
     output = Path("output/assignment_2")
@@ -376,6 +549,25 @@ def main():
         roa_fig = plot_upright_roa(roa_result)
         roa_fig.savefig(output / "upright_roa.png")
         print(f"Saved {output / 'upright_roa.png'}.")
+    elif args.command == "return-map":
+        sim_time = 5.0
+        large_timestep = 1e-2
+        small_timestep = 1e-4
+
+        start = time.perf_counter()
+        return_map = compute_return_map(
+            params,
+            large_timestep,
+            small_timestep,
+            sim_time,
+        )
+        jax.block_until_ready(return_map)
+        end = time.perf_counter()
+        print(f"Computed return map in {end - start}s")
+
+        return_map_fig = plot_return_map(return_map)
+        return_map_fig.savefig(output / "return_map.png")
+        print(f"Saved {output / 'return_map.png'}.")
 
     plt.show()
 
