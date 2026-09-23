@@ -45,6 +45,14 @@ class StepsToStabilityResult:
     alpha_values: np.ndarray
 
 
+@jax.tree_util.register_dataclass
+@dataclass
+class InitialStateStepsResult:
+    theta_values: jax.Array
+    theta_dot_values: jax.Array
+    steps_grid: jax.Array
+
+
 def compute_ankle_torque(state, params):
     m = params["mass"]
     g = params["gravity"]
@@ -273,15 +281,16 @@ def can_stabilize(
     controller = StandingController(params["angle_of_attack_bounds"][0])
 
     def wrap_angle(theta):
-        return jnp.abs((theta + jnp.pi) % (2 * jnp.pi) - jnp.pi)
+        return (theta + jnp.pi) % (2 * jnp.pi) - jnp.pi
 
-    def fell_over(state):
+    def fell_backwards(state):
         theta, _ = state
-        return wrap_angle(theta) > jnp.deg2rad(89)
+        collide_angle = jnp.deg2rad(-90.0) + params["incline"]
+        return wrap_angle(theta) < collide_angle - jnp.deg2rad(1.0)
 
     def stabilized(state):
         theta, theta_dot = state
-        return (wrap_angle(theta) < np.deg2rad(1)) & (
+        return (jnp.abs(wrap_angle(theta)) < np.deg2rad(1)) & (
             jnp.abs(theta_dot) < np.deg2rad(0.1)
         )
 
@@ -297,7 +306,7 @@ def can_stabilize(
         stable = stabilized(next_state)
         next_time = time + timestep
         done = (
-            fell_over(next_state)
+            fell_backwards(next_state)
             | stable
             | collision_occurred
             | (next_time >= sim_time)
@@ -385,20 +394,22 @@ def plot_upright_roa(result: RoAResult):
     return fig
 
 
-def get_next_poincare_velocity(
-    theta_dot,
+def get_poincare_crossing(
+    initial_state,
     alpha,
     params,
     large_timestep,
     small_timestep,
     max_sim_time,
+    require_impact,
 ):
-    """Return theta dot at the next positive crossing of the theta=0 section."""
+    """Return velocity and impact count at a positive theta=0 crossing."""
     POINCARE_THETA = 0.0
-    FALL_ANGLE = jnp.deg2rad(-89.0)
+    FALL_ANGLE = params["incline"] - jnp.pi / 2 - jnp.deg2rad(1.0)
 
     control = jnp.array([0.0, alpha])
     dynamics = ft.partial(model.dynamics, control=control, params=params)
+    require_impact = jnp.asarray(require_impact)
 
     def refine_section_crossing(time, state, timestep):
         def before_section(carry):
@@ -419,11 +430,11 @@ def get_next_poincare_velocity(
         return crossing_state
 
     def continue_simulation(carry):
-        _, time, _, section_crossed, fell_backward = carry
+        _, time, _, section_crossed, fell_backward, _ = carry
         return ~section_crossed & ~fell_backward & (time < max_sim_time)
 
     def take_step(carry):
-        state, time, impact_occurred, _, _ = carry
+        state, time, impact_occurred, _, _, impact_count = carry
         timestep = jnp.minimum(large_timestep, max_sim_time - time)
         next_state, impact_this_step = simulation_step(
             time,
@@ -435,9 +446,10 @@ def get_next_poincare_velocity(
         )
 
         section_crossed = (
-            impact_occurred
+            (~require_impact | impact_occurred)
             & (state[0] <= POINCARE_THETA)
             & (next_state[0] >= POINCARE_THETA)
+            & (next_state[1] >= 0.0)
         )
         next_state = jax.lax.cond(
             section_crossed,
@@ -452,21 +464,50 @@ def get_next_poincare_velocity(
             impact_occurred | impact_this_step,
             section_crossed,
             fell_backward,
+            impact_count + impact_this_step.astype(int),
         )
 
-    final_state, _, _, section_crossed, _ = jax.lax.while_loop(
+    starts_on_section = (
+        ~require_impact
+        & (initial_state[0] == POINCARE_THETA)
+        & (initial_state[1] >= 0.0)
+    )
+    final_state, _, _, section_crossed, _, impact_count = jax.lax.while_loop(
         continue_simulation,
         take_step,
         (
-            jnp.array([POINCARE_THETA, theta_dot]),
+            initial_state,
             jnp.asarray(0.0),
             jnp.asarray(False),
+            starts_on_section,
             jnp.asarray(False),
-            jnp.asarray(False),
+            jnp.asarray(0),
         ),
     )
 
-    return jnp.where(section_crossed, final_state[1], jnp.nan)
+    crossing_velocity = jnp.where(section_crossed, final_state[1], jnp.nan)
+    return crossing_velocity, impact_count
+
+
+def get_next_poincare_velocity(
+    theta_dot,
+    alpha,
+    params,
+    large_timestep,
+    small_timestep,
+    max_sim_time,
+):
+    """Return theta dot at the next positive crossing of the theta=0 section."""
+    crossing_velocity, _ = get_poincare_crossing(
+        jnp.array([0.0, theta_dot]),
+        alpha,
+        params,
+        large_timestep,
+        small_timestep,
+        max_sim_time,
+        require_impact=True,
+    )
+    return crossing_velocity
 
 
 @jax.jit
@@ -646,6 +687,98 @@ def plot_steps_to_stability(result: StepsToStabilityResult):
     return fig
 
 
+@jax.jit
+def compute_initial_state_steps(
+    params,
+    theta_values,
+    theta_dot_values,
+    policy_map,
+    large_timestep,
+    small_timestep,
+    max_sim_time,
+):
+    """Estimate steps under the policy from a grid of arbitrary initial states.
+
+    Every state coasts with zero ankle torque to the positive theta=0 section,
+    where the lookup table policy takes over.
+    """
+    initial_states = jnp.stack(
+        jnp.meshgrid(theta_values, theta_dot_values, indexing="ij"), axis=-1
+    )
+    flat_initial_states = initial_states.reshape((-1, 2))
+    alpha = params["angle_of_attack_bounds"][0]
+
+    crossing_velocities, impacts_before_section = jax.vmap(
+        get_poincare_crossing,
+        in_axes=(0, None, None, None, None, None, None),
+    )(
+        flat_initial_states,
+        alpha,
+        params,
+        large_timestep,
+        small_timestep,
+        max_sim_time,
+        False,
+    )
+
+    closest_indices = jnp.argmin(
+        jnp.abs(crossing_velocities[:, None] - policy_map[None, :, 0]), axis=1
+    )
+    policy_steps = policy_map[closest_indices, 1].astype(int)
+    total_steps = jnp.where(
+        jnp.isfinite(crossing_velocities) & (policy_steps >= 0),
+        impacts_before_section + policy_steps,
+        -1,
+    )
+
+    return InitialStateStepsResult(
+        theta_values=theta_values,
+        theta_dot_values=theta_dot_values,
+        steps_grid=total_steps.reshape((theta_values.size, theta_dot_values.size)),
+    )
+
+
+def plot_initial_state_steps(result: InitialStateStepsResult):
+    steps_grid = np.asarray(result.steps_grid)
+    max_steps = max(0, np.max(steps_grid))
+    step_colors = plt.get_cmap("viridis")(np.linspace(0.15, 0.95, max_steps + 1))
+    color_map = ListedColormap(["#6c757d", *step_colors])
+    color_norm = BoundaryNorm(np.arange(max_steps + 3) - 0.5, color_map.N)
+    plot_grid = np.where(steps_grid < 0, 0, steps_grid + 1)
+
+    fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
+    ax.pcolormesh(
+        np.rad2deg(result.theta_values),
+        np.rad2deg(result.theta_dot_values),
+        plot_grid.T,
+        cmap=color_map,
+        norm=color_norm,
+        shading="nearest",
+    )
+
+    legend_handles = [Patch(color="#6c757d", label="Unreachable")]
+    legend_handles.extend(
+        Patch(
+            color=step_colors[steps],
+            label=f"{steps} step" if steps == 1 else f"{steps} steps",
+        )
+        for steps in range(max_steps + 1)
+        if np.any(steps_grid == steps)
+    )
+    ax.legend(
+        handles=legend_handles,
+        title="Steps to stability",
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+    )
+    ax.set_title("Estimated Steps to Stability from Initial State")
+    ax.set_xlabel(r"Initial angle $\theta$ (deg)")
+    ax.set_ylabel(r"Initial angular velocity $\dot{\theta}$ (deg/s)")
+    ax.grid(alpha=0.25)
+
+    return fig
+
+
 def create_walker_animation(
     time_traj, state_traj, control_traj, params, timestep, fps=25
 ):
@@ -686,7 +819,19 @@ def main():
     )
     subparsers.add_parser("return-map", help="plot the theta=0 Poincare return map")
     subparsers.add_parser(
-        "lookup-table", help="compute minimum steps from the return map to the RoA"
+        "lookup-table",
+        help="compute minimum steps to the ankle controller's RoA and save the optimal alphas",
+    )
+    initial_state_steps_parser = subparsers.add_parser(
+        "initial-state-steps",
+        help="plot estimated steps to stability over the full initial-state grid",
+    )
+    initial_state_steps_parser.add_argument(
+        "map_file",
+        nargs="?",
+        type=Path,
+        default=Path("output/assignment_2/policy_map.npy"),
+        help="policy map generated by lookup-table",
     )
     args = parser.parse_args()
 
@@ -859,9 +1004,52 @@ def main():
                 steps_result.alpha_values,
             )
         )
-        policy_map_path = output / "steps_to_stability.npy"
+        policy_map_path = output / "policy_map.npy"
         np.save(policy_map_path, policy_map)
         print(f"Saved {steps_path} and {policy_map_path}.")
+    elif args.command == "initial-state-steps":
+        NUM_THETAS = 400
+        NUM_THETA_DOTS = 400
+        MAX_FROUDE = 2.0
+        MAX_SIM_TIME = 5.0
+        LARGE_TIMESTEP = 1e-2
+        SMALL_TIMESTEP = 1e-4
+
+        initial_alpha = params["angle_of_attack_bounds"][0]
+        theta_values = jnp.linspace(
+            params["incline"] - jnp.pi / 2,
+            params["incline"] + initial_alpha,
+            NUM_THETAS,
+        )
+        theta_dot_values = jnp.linspace(
+            jnp.deg2rad(-100.0),
+            jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
+            NUM_THETA_DOTS,
+        )
+        policy_map = jnp.asarray(np.load(args.map_file, allow_pickle=False))
+
+        start = time.perf_counter()
+        result = compute_initial_state_steps(
+            params,
+            theta_values,
+            theta_dot_values,
+            policy_map,
+            LARGE_TIMESTEP,
+            SMALL_TIMESTEP,
+            MAX_SIM_TIME,
+        )
+        jax.block_until_ready(result)
+        end = time.perf_counter()
+        print(f"Computed initial-state steps in {end - start}s")
+        print(
+            f"Reachable states: {np.count_nonzero(result.steps_grid >= 0)}/"
+            f"{result.steps_grid.size}; maximum steps: {np.max(result.steps_grid)}"
+        )
+
+        steps_fig = plot_initial_state_steps(result)
+        steps_path = output / "initial_state_steps.png"
+        steps_fig.savefig(steps_path)
+        print(f"Saved {steps_path}.")
 
     plt.show()
 
