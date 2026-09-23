@@ -13,11 +13,11 @@ def generate_params():
     pass
 
 
-def dynamics(t, state, params):
+def dynamics(t, state, control, params):
     m = params["mass"]
     g = params["gravity"]
     l = params["length"]
-    ankle_torque = params["ankle_torque"]
+    ankle_torque, _ = control
     theta, theta_dot = state
 
     theta_double_dot = (m * g * l * jnp.sin(theta) + ankle_torque) / (m * l**2)
@@ -25,8 +25,8 @@ def dynamics(t, state, params):
     return jnp.array([theta_dot, theta_double_dot])
 
 
-def event_guard(previous_state, next_state, params):
-    alpha = params["angle_of_attack"]
+def event_guard(previous_state, next_state, control, params):
+    _, alpha = control
     gamma = params["incline"]
 
     max_theta = gamma + alpha  # only alpha > 0 is allowed
@@ -37,8 +37,8 @@ def event_guard(previous_state, next_state, params):
     return (theta_prev <= max_theta) & (theta_next >= max_theta)
 
 
-def event_dynamics(state, params):
-    alpha = params["angle_of_attack"]
+def event_dynamics(state, control, params):
+    _, alpha = control
     gamma = params["incline"]
 
     _, theta_dot = state
@@ -65,6 +65,7 @@ def calculate_energy(state, params):
 def visualize(
     state,
     params,
+    control,
     ax=None,
     *,
     show_swing=True,
@@ -81,10 +82,9 @@ def visualize(
     params : dict
         ``length`` is the leg length in meters. ``incline`` is the ground's
         downhill slope angle in radians (positive slopes descend to the right).
-        ``angle_of_attack`` is HALF the angle between the stance and forward swing
-        legs, in radians; it is needed only when show_swing=True.
-        ``ankle_torque`` (optional, default 0) is displayed in N m, with positive
-        torque acting in the positive theta direction. Other keys are ignored.
+    control : array-like, shape (2,)
+        Ankle torque in N m and angle of attack in radians. Positive torque acts
+        in the positive theta direction.
     ax : matplotlib.axes.Axes, optional
         Axes to clear and reuse. If omitted, create a figure. This function
         neither shows nor saves it: use plt.show() or ax.figure.savefig(...).
@@ -108,24 +108,25 @@ def visualize(
     at a fixed frame rate, and pass the parameters actually used at each frame.
     """
     state = np.asarray(state, dtype=float)
+    control = np.asarray(control, dtype=float)
     foot = np.asarray(stance_position, dtype=float)
     if state.shape != (2,) or not np.all(np.isfinite(state)):
         raise ValueError("state must contain two finite values: [theta, velocity].")
+    if control.shape != (2,) or not np.all(np.isfinite(control)):
+        raise ValueError("control must contain finite [ankle_torque, alpha] values.")
     if foot.shape != (2,) or not np.all(np.isfinite(foot)):
         raise ValueError("stance_position must contain two finite values: [x, y].")
     length = float(params["length"])
     incline = float(params["incline"])
-    torque = float(params.get("ankle_torque", 0.0))
+    torque, angle_of_attack = control
     if not np.isfinite(length) or length <= 0:
         raise ValueError("length must be finite and positive.")
     if not np.isfinite(incline) or abs(incline) >= np.pi / 2:
         raise ValueError("incline must be finite and between -pi/2 and pi/2.")
     if not np.isfinite(torque):
         raise ValueError("ankle_torque must be finite.")
-    if show_swing:
-        angle_of_attack = float(params["angle_of_attack"])
-        if not np.isfinite(angle_of_attack):
-            raise ValueError("angle_of_attack must be finite.")
+    if show_swing and not np.isfinite(angle_of_attack):
+        raise ValueError("angle_of_attack must be finite.")
 
     if view_limits is None:
         radius = 2.15 * length
@@ -211,7 +212,8 @@ def visualize(
         0.97,
         f"$\\theta$ = {theta:.3f} rad\n"
         f"$\\dot\\theta$ = {angular_velocity:.3f} rad/s\n"
-        f"$\\tau$ = {torque:.3f} N m",
+        f"$\\tau$ = {torque:.3f} N m\n"
+        f"$\\alpha$ = {angle_of_attack:.3f} rad",
         transform=ax.transAxes,
         va="top",
         fontsize=10,

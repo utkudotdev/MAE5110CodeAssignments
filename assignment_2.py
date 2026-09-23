@@ -42,6 +42,7 @@ class ReturnMapResult:
 class StepsToStabilityResult:
     theta_dot_values: np.ndarray
     steps: np.ndarray
+    alpha_values: np.ndarray
 
 
 def compute_ankle_torque(state, params):
@@ -58,10 +59,11 @@ def compute_ankle_torque(state, params):
     return clipped
 
 
-def simulation_step(
-    time, state, timestep, small_timestep, params, use_ankle_controller=True
-):
+def simulation_step(time, state, control, timestep, small_timestep, params):
     """Advance by ``timestep``, using ``small_timestep`` near an impact.
+
+    ``control`` contains ankle torque and angle of attack, and is held constant
+    for the entire outer timestep.
 
     The inexpensive full-size integration is retained when it does not cross an
     event guard. If it does, the step is replayed with `small_timestep` through
@@ -71,16 +73,10 @@ def simulation_step(
 
     At most one impact is supported within a timestep.
     """
-    ankle_torque = jnp.where(
-        use_ankle_controller,
-        compute_ankle_torque(state, params),
-        0.0,
-    )
-    controlled_params = {**params, "ankle_torque": ankle_torque}
-    dynamics = ft.partial(model.dynamics, params=controlled_params)
+    dynamics = ft.partial(model.dynamics, control=control, params=params)
 
     full_step_state = rk4(dynamics, time, state, timestep)
-    full_step_collision = model.event_guard(state, full_step_state, controlled_params)
+    full_step_collision = model.event_guard(state, full_step_state, control, params)
 
     def refine_collision():
         def searching_for_impact(carry):
@@ -92,11 +88,11 @@ def simulation_step(
             step_size = jnp.minimum(small_timestep, timestep - elapsed)
             next_state = rk4(dynamics, time + elapsed, current_state, step_size)
             collision_occurred = model.event_guard(
-                current_state, next_state, controlled_params
+                current_state, next_state, control, params
             )
             next_state = jax.lax.cond(
                 collision_occurred,
-                lambda: model.event_dynamics(next_state, controlled_params),
+                lambda: model.event_dynamics(next_state, control, params),
                 lambda: next_state,
             )
             return next_state, elapsed + step_size, collision_occurred
@@ -119,9 +115,17 @@ def simulation_step(
 
 
 @ft.partial(jax.jit, static_argnames=["num_timesteps"])
-def simulate(initial_state, timestep, small_timestep, num_timesteps, params):
+def simulate(
+    initial_state,
+    timestep,
+    small_timestep,
+    num_timesteps,
+    params,
+    controller,
+):
     """Simulates the systems starting from `initial_state` for `num_timesteps`
-    steps of length `timestep`. Returns `(time_traj, state_traj, impacts)`.
+    steps of length `timestep`. Returns
+    `(time_traj, state_traj, impacts, control_traj)`.
 
     `time_traj` is of length `num_timesteps + 1` and indicates the time at which
     each state in `state_traj` occurred. `state_traj` is of shape (2, `num_timesteps + 1`),
@@ -129,40 +133,115 @@ def simulate(initial_state, timestep, small_timestep, num_timesteps, params):
     and is true when a forward impact occurred during that timestep. When an
     impact occurs, the corresponding state is recorded at the end of the
     timestep, after event dynamics and the remaining integration.
+
+    The immutable controller is updated at the start of each outer timestep.
+    It returns its next state and the control ``[ankle_torque, alpha]`` to use
+    during that timestep. Each returned control is paired with the state and
+    time at which it was evaluated; the final control is evaluated without
+    taking an additional simulation step.
     """
 
     def step(carry, _):
-        t, state = carry
+        t, state, current_controller = carry
+
+        next_controller, control = current_controller.update(state, params)
 
         next_state, collision_occurred = simulation_step(
-            t, state, timestep, small_timestep, params
+            t, state, control, timestep, small_timestep, params
         )
 
         next_t = t + timestep
+        next_carry = (next_t, next_state, next_controller)
+        return next_carry, (t, state, collision_occurred, control)
 
-        return (next_t, next_state), (next_t, next_state, collision_occurred)
+    (
+        (final_time, final_state, final_controller),
+        (
+            time_traj,
+            state_traj,
+            step_impacts,
+            control_traj,
+        ),
+    ) = jax.lax.scan(
+        step,
+        (0.0, initial_state, controller),
+        length=num_timesteps,
+    )
+    _, final_control = final_controller.update(final_state, params)
 
-    _, (time_traj, state_traj, impacts) = jax.lax.scan(
-        step, (0.0, initial_state), length=num_timesteps
+    time_traj = jnp.concatenate([time_traj, final_time.reshape((1,))])
+    state_traj = jnp.concatenate([state_traj, final_state.reshape((1, -1))]).T
+    impacts = jnp.concatenate([jnp.array([False]), step_impacts])
+    control_traj = jnp.concatenate(
+        [control_traj, final_control.reshape((1, -1))], axis=0
     )
 
-    time_traj = jnp.concatenate([jnp.array([0.0]), time_traj])
-    state_traj = jnp.concatenate([initial_state.reshape((-1, 1)), state_traj.T], axis=1)
-    impacts = jnp.concatenate([jnp.array([False]), impacts])
-
-    return time_traj, state_traj, impacts
+    return time_traj, state_traj, impacts, control_traj
 
 
-def calculate_absolute_energy(state_traj, impacts, params):
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class StandingController:
+    alpha: jax.Array
+
+    def update(self, state, params):
+        control = jnp.array([compute_ankle_torque(state, params), self.alpha])
+        return self, control
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class LookupTableController:
+    policy_map: jax.Array
+    previous_theta: jax.Array
+    alpha: jax.Array
+    ankle_controller_enabled: jax.Array
+    initialized: jax.Array
+
+    def update(self, state, params):
+        section_crossed = ~self.initialized | (
+            (self.previous_theta <= 0.0) & (state[0] > 0.0)
+        )
+        closest_index = jnp.argmin(jnp.abs(self.policy_map[:, 0] - state[1]))
+        steps_remaining = self.policy_map[closest_index, 1]
+        selected_alpha = self.policy_map[closest_index, 2]
+        ankle_controller_enabled = self.ankle_controller_enabled | (
+            section_crossed & (steps_remaining == 0)
+        )
+        alpha = jnp.where(
+            section_crossed & (steps_remaining > 0),
+            selected_alpha,
+            self.alpha,
+        )
+        ankle_torque = jnp.where(
+            ankle_controller_enabled,
+            compute_ankle_torque(state, params),
+            0.0,
+        )
+
+        next_controller = LookupTableController(
+            policy_map=self.policy_map,
+            previous_theta=state[0],
+            alpha=alpha,
+            ankle_controller_enabled=ankle_controller_enabled,
+            initialized=jnp.asarray(True),
+        )
+        control = jnp.array([ankle_torque, alpha])
+        return next_controller, control
+
+
+def calculate_absolute_energy(state_traj, impacts, params, control_traj):
     """Return kinetic and potential energy in a fixed global reference frame."""
     gravity = params["gravity"]
     mass = params["mass"]
     length = params["length"]
     incline = params["incline"]
-    angle_of_attack = params["angle_of_attack"]
+    # impacts[i] describes the integration step from state i-1 to state i.
+    alpha_traj = control_traj[:, 1]
+    impact_alphas = jnp.concatenate([alpha_traj[:1], alpha_traj[:-1]])
 
     kinetic_energy, potential_energy = model.calculate_energy(state_traj, params)
-    step_height = 2 * length * jnp.sin(angle_of_attack) * jnp.sin(incline)
+    step_height = 2 * length * jnp.sin(impact_alphas) * jnp.sin(incline)
     stance_height_changes = impacts * step_height
     stance_height = jnp.cumsum(stance_height_changes)
     potential_energy = potential_energy + mass * gravity * stance_height
@@ -170,9 +249,9 @@ def calculate_absolute_energy(state_traj, impacts, params):
     return kinetic_energy, potential_energy
 
 
-def plot_energy(time_traj, state_traj, impacts, params):
+def plot_energy(time_traj, state_traj, impacts, params, control_traj):
     kinetic_energy, potential_energy = calculate_absolute_energy(
-        state_traj, impacts, params
+        state_traj, impacts, params, control_traj
     )
 
     fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
@@ -186,6 +265,53 @@ def plot_energy(time_traj, state_traj, impacts, params):
     ax.legend()
 
     return fig
+
+
+def can_stabilize(
+    initial_state, params, large_timestep, small_timestep, sim_time
+) -> jax.Array:
+    controller = StandingController(params["angle_of_attack_bounds"][0])
+
+    def wrap_angle(theta):
+        return jnp.abs((theta + jnp.pi) % (2 * jnp.pi) - jnp.pi)
+
+    def fell_over(state):
+        theta, _ = state
+        return wrap_angle(theta) > jnp.deg2rad(89)
+
+    def stabilized(state):
+        theta, theta_dot = state
+        return (wrap_angle(theta) < np.deg2rad(1)) & (
+            jnp.abs(theta_dot) < np.deg2rad(0.1)
+        )
+
+    def step(val):
+        state, time, _, _ = val
+
+        timestep = jnp.minimum(large_timestep, sim_time - time)
+        _, control = controller.update(state, params)
+        next_state, collision_occurred = simulation_step(
+            time, state, control, timestep, small_timestep, params
+        )
+
+        stable = stabilized(next_state)
+        next_time = time + timestep
+        done = (
+            fell_over(next_state)
+            | stable
+            | collision_occurred
+            | (next_time >= sim_time)
+        )
+
+        return next_state, next_time, stable, done
+
+    _, _, stable, _ = jax.lax.while_loop(
+        lambda t: ~t[3],
+        step,
+        (initial_state, 0.0, jnp.array(False), jnp.array(False)),
+    )
+
+    return stable
 
 
 @jax.jit
@@ -271,12 +397,8 @@ def get_next_poincare_velocity(
     POINCARE_THETA = 0.0
     FALL_ANGLE = jnp.deg2rad(-89.0)
 
-    return_map_params = {
-        **params,
-        "angle_of_attack": alpha,
-        "ankle_torque": jnp.asarray(0.0),
-    }
-    dynamics = ft.partial(model.dynamics, params=return_map_params)
+    control = jnp.array([0.0, alpha])
+    dynamics = ft.partial(model.dynamics, control=control, params=params)
 
     def refine_section_crossing(time, state, timestep):
         def before_section(carry):
@@ -306,10 +428,10 @@ def get_next_poincare_velocity(
         next_state, impact_this_step = simulation_step(
             time,
             state,
+            control,
             timestep,
             small_timestep,
-            return_map_params,
-            use_ankle_controller=False,
+            params,
         )
 
         section_crossed = (
@@ -437,6 +559,7 @@ def compute_steps_to_stability(
         raise ValueError("The RoA theta grid must contain theta=0.")
 
     steps = np.full(theta_dot_values.shape, -1, dtype=int)
+    alpha_values = np.full(theta_dot_values.shape, np.nan)
     in_upright_roa = (
         np.asarray(roa_result.classification_grid[poincare_index])
         == RoAClassification.STABILIZABLE
@@ -452,20 +575,30 @@ def compute_steps_to_stability(
             break
 
         candidate_next_states = next_theta_dot_grid[:, unmarked_indices]
-        close_to_marked = (
-            np.abs(candidate_next_states[:, :, None] - marked_velocities[None, None, :])
-            <= state_match_tolerance
+        distances = np.abs(
+            candidate_next_states[:, :, None] - marked_velocities[None, None, :]
         )
-        newly_reachable = np.any(close_to_marked, axis=(0, 2))
+        distances = np.where(np.isfinite(distances), distances, np.inf)
+        closest_marked_distance = np.min(distances, axis=2)
+        best_alpha_indices = np.argmin(closest_marked_distance, axis=0)
+        best_distances = closest_marked_distance[
+            best_alpha_indices, np.arange(unmarked_indices.size)
+        ]
+        newly_reachable = best_distances <= state_match_tolerance
         if not np.any(newly_reachable):
             break
 
-        steps[unmarked_indices[newly_reachable]] = next_step_count
+        newly_reachable_indices = unmarked_indices[newly_reachable]
+        steps[newly_reachable_indices] = next_step_count
+        alpha_values[newly_reachable_indices] = np.asarray(
+            return_map_result.alpha_values
+        )[best_alpha_indices[newly_reachable]]
         next_step_count += 1
 
     return StepsToStabilityResult(
         theta_dot_values=theta_dot_values,
         steps=steps,
+        alpha_values=alpha_values,
     )
 
 
@@ -513,56 +646,14 @@ def plot_steps_to_stability(result: StepsToStabilityResult):
     return fig
 
 
-def can_stabilize(
-    initial_state, params, large_timestep, small_timestep, sim_time
-) -> jax.Array:
-    def wrap_angle(theta):
-        return jnp.abs((theta + jnp.pi) % (2 * jnp.pi) - jnp.pi)
-
-    def fell_over(state):
-        theta, _ = state
-        return wrap_angle(theta) > jnp.deg2rad(89)
-
-    def stabilized(state):
-        theta, theta_dot = state
-        return (wrap_angle(theta) < np.deg2rad(1)) & (
-            jnp.abs(theta_dot) < np.deg2rad(0.1)
-        )
-
-    def step(val):
-        state, time, _, _ = val
-
-        timestep = jnp.minimum(large_timestep, sim_time - time)
-        next_state, collision_occurred = simulation_step(
-            time, state, timestep, small_timestep, params
-        )
-
-        stable = stabilized(next_state)
-        next_time = time + timestep
-        done = (
-            fell_over(next_state)
-            | stable
-            | collision_occurred
-            | (next_time >= sim_time)
-        )
-
-        return next_state, next_time, stable, done
-
-    _, _, stable, _ = jax.lax.while_loop(
-        lambda t: ~t[3],
-        step,
-        (initial_state, 0.0, jnp.array(False), jnp.array(False)),
-    )
-
-    return stable
-
-
-def create_walker_animation(time_traj, state_traj, params, timestep, fps=25):
+def create_walker_animation(
+    time_traj, state_traj, control_traj, params, timestep, fps=25
+):
     fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
 
     def draw_frame(index):
         # The massless swing leg is repositioned instantaneously at each impact.
-        model.visualize(state_traj[:, index], params, ax=ax)
+        model.visualize(state_traj[:, index], params, control_traj[index], ax=ax)
         ax.set_title(f"t = {time_traj[index]:.2f} s")
 
     # Simulate at a small timestep, but render only at the requested frame rate.
@@ -581,7 +672,15 @@ def main():
         description="Simulate the inverted pendulum walker"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("trajectory", help="animate a trajectory and plot its energy")
+    trajectory_parser = subparsers.add_parser(
+        "trajectory", help="animate a trajectory and plot its energy"
+    )
+    trajectory_parser.add_argument(
+        "map_file",
+        nargs="?",
+        type=Path,
+        help="optional .npy policy map generated by lookup-table",
+    )
     subparsers.add_parser(
         "roa", help="plot the upright controller's region of attraction"
     )
@@ -596,9 +695,7 @@ def main():
         "length": 1.0,  # m
         "mass": 1.0,  # kg
         "incline": 0.06,  # rad
-        "angle_of_attack": np.pi / 8,  # rad
         "angle_of_attack_bounds": np.array([np.pi / 8, np.pi / 7]),  # rad
-        "ankle_torque": 0.0,  # N m
         "ankle_torque_bounds": np.array([-0.1 * 9.81, 0.05 * 9.81]),  # N m
         "ankle_torque_damping": 5.0,
     }
@@ -610,29 +707,46 @@ def main():
         timestep = 1e-3
         small_timestep = 1e-4
         num_timesteps = round(sim_time / timestep)
-        initial_state = np.array([params["incline"], 2.0])
+        initial_state = np.array([-0.1, 3.0])
 
         start = time.perf_counter()
-        time_traj, state_traj, impacts = simulate(
-            initial_state, timestep, small_timestep, num_timesteps, params
+        initial_alpha = jnp.asarray(params["angle_of_attack_bounds"][0])
+        controller = StandingController(initial_alpha)
+        if args.map_file is not None:
+            policy_map = np.load(args.map_file, allow_pickle=False)
+            # The policy is defined on the theta=0 Poincare section.
+            controller = LookupTableController(
+                policy_map=jnp.asarray(policy_map),
+                previous_theta=jnp.asarray(initial_state[0]),
+                alpha=initial_alpha,
+                ankle_controller_enabled=jnp.asarray(False),
+                initialized=jnp.asarray(False),
+            )
+        time_traj, state_traj, impacts, control_traj = simulate(
+            initial_state,
+            timestep,
+            small_timestep,
+            num_timesteps,
+            params,
+            controller,
         )
-        jax.block_until_ready((time_traj, state_traj, impacts))
+        jax.block_until_ready((time_traj, state_traj, impacts, control_traj))
         end = time.perf_counter()
         print(f"Computed trajectory in {end - start}s")
 
         fps = 25
         animation = create_walker_animation(
-            time_traj, state_traj, params, timestep, fps
+            time_traj, state_traj, control_traj, params, timestep, fps
         )
         animation.save(output / "walker.gif", writer=PillowWriter(fps=fps))
-        energy_fig = plot_energy(time_traj, state_traj, impacts, params)
+        energy_fig = plot_energy(time_traj, state_traj, impacts, params, control_traj)
         energy_fig.savefig(output / "energy.png")
         print(f"Saved {output / 'walker.gif'} and {output / 'energy.png'}.")
     elif args.command == "roa":
         NUM_THETAS = 200
         NUM_THETA_DOTS = 200
         THETA_MIN = np.deg2rad(-90.0) + params["incline"]
-        THETA_MAX = params["incline"] + params["angle_of_attack"]
+        THETA_MAX = params["incline"] + params["angle_of_attack_bounds"][0]
         THETA_DOT_MIN = np.deg2rad(-100.0)
         THETA_DOT_MAX = np.deg2rad(300.0)
         sim_time = 10.0
@@ -738,7 +852,16 @@ def main():
         steps_fig = plot_steps_to_stability(steps_result)
         steps_path = output / "steps_to_stability.png"
         steps_fig.savefig(steps_path)
-        print(f"Saved {steps_path}.")
+        policy_map = np.column_stack(
+            (
+                steps_result.theta_dot_values,
+                steps_result.steps,
+                steps_result.alpha_values,
+            )
+        )
+        policy_map_path = output / "steps_to_stability.npy"
+        np.save(policy_map_path, policy_map)
+        print(f"Saved {steps_path} and {policy_map_path}.")
 
     plt.show()
 
