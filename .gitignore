@@ -9,4 +9,4 @@ assignments_tex/
 
 # Assignment 2 figures, numerical tables, and compiled report are reproducible.
 output/
-writeups/assignment_2_results_tmp
+writeups/assignment_2_results
