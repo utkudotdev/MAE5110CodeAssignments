@@ -222,6 +222,29 @@ def is_state_in_roa(state, roa_bounds):
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
+class MinimumAlphaController:
+    roa_bounds: jax.Array
+    ankle_controller_enabled: jax.Array
+
+    def update(self, state, params):
+        ankle_controller_enabled = self.ankle_controller_enabled | is_state_in_roa(
+            state, self.roa_bounds
+        )
+        ankle_torque = jnp.where(
+            ankle_controller_enabled,
+            compute_ankle_torque(state, params),
+            0.0,
+        )
+        alpha = params["angle_of_attack_bounds"][0]
+        next_controller = MinimumAlphaController(
+            roa_bounds=self.roa_bounds,
+            ankle_controller_enabled=ankle_controller_enabled,
+        )
+        return next_controller, jnp.array([ankle_torque, alpha])
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
 class LookupTableController:
     policy_map: jax.Array
     roa_bounds: jax.Array
@@ -231,8 +254,9 @@ class LookupTableController:
     initialized: jax.Array
 
     def update(self, state, params):
-        section_crossed = ~self.initialized | (
-            (self.previous_theta <= 0.0) & (state[0] > 0.0)
+        starts_on_section = ~self.initialized & (state[0] == 0.0) & (state[1] >= 0.0)
+        section_crossed = starts_on_section | (
+            self.initialized & (self.previous_theta <= 0.0) & (state[0] > 0.0)
         )
         closest_index = jnp.argmin(jnp.abs(self.policy_map[:, 0] - state[1]))
         steps_remaining = self.policy_map[closest_index, 1]
@@ -244,7 +268,9 @@ class LookupTableController:
         walking_alpha = jnp.where(
             section_crossed & (steps_remaining > 0),
             selected_alpha,
-            self.alpha,
+            jnp.where(
+                self.initialized, self.alpha, params["angle_of_attack_bounds"][0]
+            ),
         )
         alpha = jnp.where(
             ankle_controller_enabled,
@@ -281,7 +307,8 @@ def calculate_absolute_energy(state_traj, impacts, params, control_traj):
 
     kinetic_energy, potential_energy = model.calculate_energy(state_traj, params)
     step_height = 2 * length * jnp.sin(impact_alphas) * jnp.sin(incline)
-    stance_height_changes = impacts * step_height
+    # A forward step places the new stance foot lower on the downhill slope.
+    stance_height_changes = -(impacts * step_height)
     stance_height = jnp.cumsum(stance_height_changes)
     potential_energy = potential_energy + mass * gravity * stance_height
 
@@ -302,6 +329,71 @@ def plot_energy(time_traj, state_traj, impacts, params, control_traj):
     ax.set_title("Absolute Energy")
     ax.grid(alpha=0.25)
     ax.legend()
+
+    return fig
+
+
+def plot_state_space(state_traj, impacts, control_traj, params):
+    theta_degrees = np.rad2deg(np.asarray(state_traj[0]))
+    theta_dot_degrees = np.rad2deg(np.asarray(state_traj[1]))
+    impacts = np.asarray(impacts, dtype=bool)
+    gamma = float(params["incline"])
+    alpha_values = np.unique(np.asarray(control_traj[:, 1]))
+
+    fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
+    ax.plot(theta_degrees, theta_dot_degrees, color="#23699b", linewidth=1.8)
+    ax.scatter(
+        theta_degrees[impacts],
+        theta_dot_degrees[impacts],
+        color="#df8a25",
+        s=24,
+        zorder=3,
+        label="Post-impact state",
+    )
+    ax.scatter(
+        theta_degrees[0],
+        theta_dot_degrees[0],
+        color="#2a9d8f",
+        s=45,
+        zorder=4,
+        label="Initial state",
+    )
+    ax.scatter(
+        theta_degrees[-1],
+        theta_dot_degrees[-1],
+        color="#e63946",
+        s=45,
+        zorder=4,
+        label="Final state",
+    )
+
+    for index, alpha in enumerate(alpha_values):
+        ax.axvline(
+            np.rad2deg(gamma + alpha),
+            color="#df8a25",
+            linestyle="--",
+            linewidth=1.0,
+            alpha=0.45,
+            label=r"Touchdown: $\theta=\alpha+\gamma$" if index == 0 else None,
+        )
+        ax.axvline(
+            np.rad2deg(gamma - alpha),
+            color="#6f42c1",
+            linestyle=":",
+            linewidth=1.0,
+            alpha=0.45,
+            label=(
+                r"Post-impact: $\theta=\gamma-\alpha=-(\alpha-\gamma)$"
+                if index == 0
+                else None
+            ),
+        )
+
+    ax.set_title("Closed-Loop State-Space Trajectory")
+    ax.set_xlabel(r"Angle $\theta$ (deg)")
+    ax.set_ylabel(r"Angular velocity $\dot{\theta}$ (deg/s)")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
 
     return fig
 
@@ -1009,9 +1101,12 @@ def compute_initial_state_steps(
 def plot_initial_state_steps(result: InitialStateStepsResult):
     steps_grid = np.asarray(result.steps_grid)
     max_steps = max(0, np.max(steps_grid))
-    step_colors = plt.get_cmap("viridis")(np.linspace(0.15, 0.95, max_steps + 1))
+    step_colors = plt.get_cmap("tab10")(np.arange(max_steps + 1))
     color_map = ListedColormap(["#6c757d", *step_colors])
-    color_norm = BoundaryNorm(np.arange(max_steps + 3) - 0.5, color_map.N)
+    color_norm = BoundaryNorm(
+        np.arange(max_steps + 3) - 0.5,
+        color_map.N,
+    )
     plot_grid = np.where(steps_grid < 0, 0, steps_grid + 1)
 
     fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
@@ -1079,10 +1174,16 @@ def main():
         "trajectory", help="animate a trajectory and plot its energy"
     )
     trajectory_parser.add_argument(
-        "map_file",
-        nargs="?",
+        "--map-file",
         type=Path,
-        help="optional .npy policy map generated by lookup-table",
+        default=Path("output/assignment_2/policy_map.npy"),
+        help="policy map generated by lookup-table",
+    )
+    trajectory_parser.add_argument(
+        "--controller",
+        choices=("standing", "lookup", "minimum-alpha"),
+        required=True,
+        help="controller to simulate",
     )
     trajectory_parser.add_argument(
         "--roa-bounds-file",
@@ -1109,8 +1210,7 @@ def main():
         help="plot estimated steps to stability over the full initial-state grid",
     )
     initial_state_steps_parser.add_argument(
-        "map_file",
-        nargs="?",
+        "--map-file",
         type=Path,
         default=Path("output/assignment_2/policy_map.npy"),
         help="policy map generated by lookup-table",
@@ -1144,8 +1244,16 @@ def main():
 
         start = time.perf_counter()
         initial_alpha = jnp.asarray(params["angle_of_attack_bounds"][0])
-        controller = StandingController(initial_alpha)
-        if args.map_file is not None:
+        controller_name = args.controller
+        if controller_name == "standing":
+            controller = StandingController(initial_alpha)
+        elif controller_name == "minimum-alpha":
+            roa_bounds = jnp.asarray(np.load(args.roa_bounds_file, allow_pickle=False))
+            controller = MinimumAlphaController(
+                roa_bounds=roa_bounds,
+                ankle_controller_enabled=jnp.asarray(False),
+            )
+        else:
             policy_map = np.load(args.map_file, allow_pickle=False)
             roa_bounds = np.load(args.roa_bounds_file, allow_pickle=False)
             # The policy is defined on the theta=0 Poincare section.
@@ -1157,6 +1265,7 @@ def main():
                 ankle_controller_enabled=jnp.asarray(False),
                 initialized=jnp.asarray(False),
             )
+        print(f"Using {controller_name} controller.")
         time_traj, state_traj, impacts, control_traj = simulate(
             initial_state,
             timestep,
@@ -1176,7 +1285,17 @@ def main():
         animation.save(output / "walker.gif", writer=PillowWriter(fps=fps))
         energy_fig = plot_energy(time_traj, state_traj, impacts, params, control_traj)
         energy_fig.savefig(output / "energy.png")
-        print(f"Saved {output / 'walker.gif'} and {output / 'energy.png'}.")
+        state_space_fig = plot_state_space(
+            state_traj,
+            impacts,
+            control_traj,
+            params,
+        )
+        state_space_fig.savefig(output / "state_space.png")
+        print(
+            f"Saved {output / 'walker.gif'}, {output / 'energy.png'}, and "
+            f"{output / 'state_space.png'}."
+        )
     elif args.command == "roa":
         NUM_THETAS = 200
         NUM_THETA_DOTS = 200
