@@ -4,15 +4,14 @@
 
 ```bash
 $ uv run assignment_2.py --help
-usage: assignment_2.py [-h] {trajectory,roa,return-map,lookup-table,...
+usage: assignment_2.py [-h] {trajectory,roa,lookup-table,...
 
 Simulate the inverted pendulum walker
 
 positional arguments:
-  {trajectory,roa,return-map,lookup-table,initial-state-steps}
+  {trajectory,roa,lookup-table,initial-state-steps}
     trajectory          animate a trajectory and plot its energy
     roa                 plot the upright controller's region of attraction
-    return-map          plot the theta=0 Poincare return map
     lookup-table        compute minimum steps to the ankle controller's RoA...
     initial-state-steps
                         plot estimated steps to stability over the full...
@@ -36,6 +35,9 @@ uv run assignment_2.py trajectory --controller lookup \
     --map-file output/assignment_2/policy_map.npy \
     --roa-bounds-file output/assignment_2/roa_bounds.npy
 ```
+
+Note that some of the later plots also require you to generate `policy_map.npy`
+and `roa_bounds.npy` first.
 
 ### Using an accelerator
 
@@ -67,7 +69,8 @@ The ankle torque is controlled via feedback linearization. We apply torque to
 remove the effects of gravity and pendulum damping, and then add the same dynamics
 with _inverted_ gravity so the pendulum behaves as if it is hanging down.
 
-![The ankle torque controller's region of attraction.](assignment_2_results/upright_roa.png)
+![The ankle torque controller's region of attraction.
+Generation instructions: `uv run assignment_2.py roa`](assignment_2_results/upright_roa.png)
 
 The ankle torque controller's region of attraction. Blue states are states which
 the controller could stabilize the pendulum. We sweep
@@ -90,6 +93,12 @@ orbits, however, as they will stabilize anyways.
 ![Flow of uncontrolled inverted pendulum](assignment_2_results/orbits.png)
 
 ## Grid resolution
+
+Note: all images in this section can be generated using the following process:
+
+1. In `assignment_2.py`, find `run_lookup_table`
+2. Edit `NUM_THETA_DOTS` and `NUM_ALPHAS` according to the plot you want
+3. Run `uv run assignment_2.py lookup-table --roa-bounds-file output/assignment_2/roa_bounds.npy`
 
 For the control lookup table grid, let's first see what happens with a very low
 resolution. A good way to check how well we are doing is to compare what we
@@ -141,7 +150,8 @@ Here is a trajectory with initial state $\theta = -0.1$, $\dot{\theta} = 3.0$. N
 that $\theta = -0.1$ was selected so the walker passes through the Poincaré section
 and the correct $\alpha$ is selected.
 
-![State space plot for trajectory with 3 steps](assignment_2_results/three_step_state_space.png)
+![State space plot for trajectory with 3 steps.
+Generation instructions: `uv run assignment_2.py trajectory --controller lookup --map-file output/assignment_2/policy_map.npy --roa-bounds-file output/assignment_2/roa_bounds.npy`](assignment_2_results/three_step_state_space.png)
 
 We can find the maximum number of steps we can take before converging to the RoA
 by always setting the $\alpha$ to the minimum. Note that there may be some initial
@@ -153,7 +163,8 @@ we first enter the RoA since the minimum $\alpha$ results in the least energy lo
 For the initial condition I picked, this works, and tells us we can take at most
 4 steps.
 
-![State space plot for same initial condition but more steps using minimal $\alpha$ controller](assignment_2_results/long_state_space.png)
+![State space plot for same initial condition but more steps using minimal $\alpha$ controller.
+Generation instructions: `uv run assignment_2.py trajectory --controller minimum-alpha --roa-bounds-file output/assignment_2/roa_bounds.npy`](assignment_2_results/long_state_space.png)
 
 ## Steps to standstill
 
@@ -161,7 +172,8 @@ We can look at a map over the whole state space of how many steps it takes to ge
 to the RoA. The earlier plots in "Grid resolution" are essentially 1D vertical
 slices of this plot.
 
-![Map showing how many steps it takes to get to the RoA from different initial conditions.](assignment_2_results/initial_state_steps.png)
+![Map showing how many steps it takes to get to the RoA from different initial conditions.
+Generation instructions: `uv run assignment_2.py initial-state-steps --map-file output/assignment_2/policy_map.npy --roa-bounds-file output/assignment_2/roa_bounds.npy`](assignment_2_results/initial_state_steps.png)
 
 This was produced with the controller with 40 theta dot values and 4 alpha values.
 The $\theta = 0$ slice should look pretty familiar if you compare it to the

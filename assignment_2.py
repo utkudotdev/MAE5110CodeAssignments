@@ -78,6 +78,103 @@ def compute_ankle_torque(state, params):
     return clipped
 
 
+def is_state_in_roa(state, roa_bounds):
+    closest_index = jnp.argmin(jnp.abs(roa_bounds[:, 0] - state[0]))
+    lower_theta_dot = roa_bounds[closest_index, 1]
+    upper_theta_dot = roa_bounds[closest_index, 2]
+    return (
+        (state[0] >= roa_bounds[0, 0])
+        & (state[0] <= roa_bounds[-1, 0])
+        & (state[1] >= lower_theta_dot)
+        & (state[1] <= upper_theta_dot)
+    )
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class StandingController:
+    alpha: jax.Array
+
+    def update(self, state, params):
+        control = jnp.array([compute_ankle_torque(state, params), self.alpha])
+        return self, control
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class MinimumAlphaController:
+    roa_bounds: jax.Array
+    ankle_controller_enabled: jax.Array
+
+    def update(self, state, params):
+        ankle_controller_enabled = self.ankle_controller_enabled | is_state_in_roa(
+            state, self.roa_bounds
+        )
+        ankle_torque = jnp.where(
+            ankle_controller_enabled,
+            compute_ankle_torque(state, params),
+            0.0,
+        )
+        alpha = params["angle_of_attack_bounds"][0]
+        next_controller = MinimumAlphaController(
+            roa_bounds=self.roa_bounds,
+            ankle_controller_enabled=ankle_controller_enabled,
+        )
+        return next_controller, jnp.array([ankle_torque, alpha])
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class LookupTableController:
+    policy_map: jax.Array
+    roa_bounds: jax.Array
+    previous_theta: jax.Array
+    alpha: jax.Array
+    ankle_controller_enabled: jax.Array
+    initialized: jax.Array
+
+    def update(self, state, params):
+        starts_on_section = ~self.initialized & (state[0] == 0.0) & (state[1] >= 0.0)
+        section_crossed = starts_on_section | (
+            self.initialized & (self.previous_theta <= 0.0) & (state[0] > 0.0)
+        )
+        closest_index = jnp.argmin(jnp.abs(self.policy_map[:, 0] - state[1]))
+        steps_remaining = self.policy_map[closest_index, 1]
+        selected_alpha = self.policy_map[closest_index, 2]
+
+        inside_roa = is_state_in_roa(state, self.roa_bounds)
+        ankle_controller_enabled = self.ankle_controller_enabled | inside_roa
+
+        walking_alpha = jnp.where(
+            section_crossed & (steps_remaining > 0),
+            selected_alpha,
+            jnp.where(
+                self.initialized, self.alpha, params["angle_of_attack_bounds"][0]
+            ),
+        )
+        alpha = jnp.where(
+            ankle_controller_enabled,
+            params["angle_of_attack_bounds"][0],
+            walking_alpha,
+        )
+        ankle_torque = jnp.where(
+            ankle_controller_enabled,
+            compute_ankle_torque(state, params),
+            0.0,
+        )
+
+        next_controller = LookupTableController(
+            policy_map=self.policy_map,
+            roa_bounds=self.roa_bounds,
+            previous_theta=state[0],
+            alpha=alpha,
+            ankle_controller_enabled=ankle_controller_enabled,
+            initialized=jnp.asarray(True),
+        )
+        control = jnp.array([ankle_torque, alpha])
+        return next_controller, control
+
+
 def simulation_step(time, state, control, timestep, small_timestep, params):
     """Advance by ``timestep``, using ``small_timestep`` near an impact.
 
@@ -196,103 +293,6 @@ def simulate(
     )
 
     return time_traj, state_traj, impacts, control_traj
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class StandingController:
-    alpha: jax.Array
-
-    def update(self, state, params):
-        control = jnp.array([compute_ankle_torque(state, params), self.alpha])
-        return self, control
-
-
-def is_state_in_roa(state, roa_bounds):
-    closest_index = jnp.argmin(jnp.abs(roa_bounds[:, 0] - state[0]))
-    lower_theta_dot = roa_bounds[closest_index, 1]
-    upper_theta_dot = roa_bounds[closest_index, 2]
-    return (
-        (state[0] >= roa_bounds[0, 0])
-        & (state[0] <= roa_bounds[-1, 0])
-        & (state[1] >= lower_theta_dot)
-        & (state[1] <= upper_theta_dot)
-    )
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class MinimumAlphaController:
-    roa_bounds: jax.Array
-    ankle_controller_enabled: jax.Array
-
-    def update(self, state, params):
-        ankle_controller_enabled = self.ankle_controller_enabled | is_state_in_roa(
-            state, self.roa_bounds
-        )
-        ankle_torque = jnp.where(
-            ankle_controller_enabled,
-            compute_ankle_torque(state, params),
-            0.0,
-        )
-        alpha = params["angle_of_attack_bounds"][0]
-        next_controller = MinimumAlphaController(
-            roa_bounds=self.roa_bounds,
-            ankle_controller_enabled=ankle_controller_enabled,
-        )
-        return next_controller, jnp.array([ankle_torque, alpha])
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class LookupTableController:
-    policy_map: jax.Array
-    roa_bounds: jax.Array
-    previous_theta: jax.Array
-    alpha: jax.Array
-    ankle_controller_enabled: jax.Array
-    initialized: jax.Array
-
-    def update(self, state, params):
-        starts_on_section = ~self.initialized & (state[0] == 0.0) & (state[1] >= 0.0)
-        section_crossed = starts_on_section | (
-            self.initialized & (self.previous_theta <= 0.0) & (state[0] > 0.0)
-        )
-        closest_index = jnp.argmin(jnp.abs(self.policy_map[:, 0] - state[1]))
-        steps_remaining = self.policy_map[closest_index, 1]
-        selected_alpha = self.policy_map[closest_index, 2]
-
-        inside_roa = is_state_in_roa(state, self.roa_bounds)
-        ankle_controller_enabled = self.ankle_controller_enabled | inside_roa
-
-        walking_alpha = jnp.where(
-            section_crossed & (steps_remaining > 0),
-            selected_alpha,
-            jnp.where(
-                self.initialized, self.alpha, params["angle_of_attack_bounds"][0]
-            ),
-        )
-        alpha = jnp.where(
-            ankle_controller_enabled,
-            params["angle_of_attack_bounds"][0],
-            walking_alpha,
-        )
-        ankle_torque = jnp.where(
-            ankle_controller_enabled,
-            compute_ankle_torque(state, params),
-            0.0,
-        )
-
-        next_controller = LookupTableController(
-            policy_map=self.policy_map,
-            roa_bounds=self.roa_bounds,
-            previous_theta=state[0],
-            alpha=alpha,
-            ankle_controller_enabled=ankle_controller_enabled,
-            initialized=jnp.asarray(True),
-        )
-        control = jnp.array([ankle_torque, alpha])
-        return next_controller, control
 
 
 def calculate_absolute_energy(state_traj, impacts, params, control_traj):
@@ -539,23 +539,22 @@ def plot_upright_roa(result: RoAResult):
     return fig
 
 
-def get_poincare_crossing(
-    initial_state,
+def get_next_poincare_velocity_or_roa(
+    theta_dot,
     alpha,
     params,
+    roa_bounds,
     large_timestep,
     small_timestep,
     max_sim_time,
-    require_impact,
-    roa_bounds=None,
 ):
-    """Return a positive theta=0 crossing or an earlier entry into the RoA."""
+    """Return the next section velocity or report earlier entry into the RoA."""
     POINCARE_THETA = 0.0
     FALL_ANGLE = params["incline"] - jnp.pi / 2 - jnp.deg2rad(1.0)
 
+    initial_state = jnp.array([POINCARE_THETA, theta_dot])
     control = jnp.array([0.0, alpha])
     dynamics = ft.partial(model.dynamics, control=control, params=params)
-    require_impact = jnp.asarray(require_impact)
 
     def refine_section_crossing(time, state, timestep):
         def before_section(carry):
@@ -576,11 +575,11 @@ def get_poincare_crossing(
         return crossing_state
 
     def continue_simulation(carry):
-        _, time, _, section_crossed, fell_backward, _, entered_roa = carry
+        _, time, _, section_crossed, fell_backward, entered_roa = carry
         return ~section_crossed & ~fell_backward & ~entered_roa & (time < max_sim_time)
 
     def take_step(carry):
-        state, time, impact_occurred, _, _, impact_count, _ = carry
+        state, time, impact_occurred, _, _, _ = carry
         timestep = jnp.minimum(large_timestep, max_sim_time - time)
         next_state, impact_this_step = simulation_step(
             time,
@@ -592,7 +591,7 @@ def get_poincare_crossing(
         )
 
         section_crossed = (
-            (~require_impact | impact_occurred)
+            impact_occurred
             & (state[0] <= POINCARE_THETA)
             & (next_state[0] >= POINCARE_THETA)
             & (next_state[1] >= 0.0)
@@ -603,11 +602,7 @@ def get_poincare_crossing(
             lambda: next_state,
         )
         fell_backward = next_state[0] < FALL_ANGLE
-        entered_roa = (
-            jnp.asarray(False)
-            if roa_bounds is None
-            else is_state_in_roa(next_state, roa_bounds)
-        )
+        entered_roa = is_state_in_roa(next_state, roa_bounds)
 
         return (
             next_state,
@@ -615,80 +610,23 @@ def get_poincare_crossing(
             impact_occurred | impact_this_step,
             section_crossed,
             fell_backward,
-            impact_count + impact_this_step.astype(int),
             entered_roa,
         )
 
-    starts_on_section = (
-        ~require_impact
-        & (initial_state[0] == POINCARE_THETA)
-        & (initial_state[1] >= 0.0)
-    )
-    starts_in_roa = (
-        jnp.asarray(False)
-        if roa_bounds is None
-        else is_state_in_roa(initial_state, roa_bounds)
-    )
-    final_state, _, _, section_crossed, _, impact_count, entered_roa = (
-        jax.lax.while_loop(
-            continue_simulation,
-            take_step,
-            (
-                initial_state,
-                jnp.asarray(0.0),
-                jnp.asarray(False),
-                starts_on_section,
-                jnp.asarray(False),
-                jnp.asarray(0),
-                starts_in_roa,
-            ),
-        )
+    final_state, _, _, section_crossed, _, entered_roa = jax.lax.while_loop(
+        continue_simulation,
+        take_step,
+        (
+            initial_state,
+            jnp.asarray(0.0),
+            jnp.asarray(False),
+            jnp.asarray(False),
+            jnp.asarray(False),
+            is_state_in_roa(initial_state, roa_bounds),
+        ),
     )
 
     crossing_velocity = jnp.where(section_crossed, final_state[1], jnp.nan)
-    return crossing_velocity, impact_count, entered_roa
-
-
-def get_next_poincare_velocity(
-    theta_dot,
-    alpha,
-    params,
-    large_timestep,
-    small_timestep,
-    max_sim_time,
-):
-    """Return theta dot at the next positive crossing of the theta=0 section."""
-    crossing_velocity, _, _ = get_poincare_crossing(
-        jnp.array([0.0, theta_dot]),
-        alpha,
-        params,
-        large_timestep,
-        small_timestep,
-        max_sim_time,
-        require_impact=True,
-    )
-    return crossing_velocity
-
-
-def get_next_poincare_velocity_or_roa(
-    theta_dot,
-    alpha,
-    params,
-    roa_bounds,
-    large_timestep,
-    small_timestep,
-    max_sim_time,
-):
-    crossing_velocity, _, entered_roa = get_poincare_crossing(
-        jnp.array([0.0, theta_dot]),
-        alpha,
-        params,
-        large_timestep,
-        small_timestep,
-        max_sim_time,
-        require_impact=True,
-        roa_bounds=roa_bounds,
-    )
     return crossing_velocity, entered_roa
 
 
@@ -700,39 +638,25 @@ def compute_return_map(
     large_timestep,
     small_timestep,
     max_sim_time,
-    roa_bounds=None,
+    roa_bounds,
 ):
-    """Sweep the theta=0 Poincare return map over theta dot and alpha."""
+    """Sweep next-section velocities and RoA entries over theta dot and alpha."""
     theta_dot_grid, alpha_grid = jnp.meshgrid(
         theta_dot_values, alpha_values, indexing="xy"
     )
 
-    if roa_bounds is None:
-        next_theta_dots = jax.vmap(
-            get_next_poincare_velocity,
-            in_axes=(0, 0, None, None, None, None),
-        )(
-            theta_dot_grid.ravel(),
-            alpha_grid.ravel(),
-            params,
-            large_timestep,
-            small_timestep,
-            max_sim_time,
-        )
-        entered_roa = jnp.zeros_like(next_theta_dots, dtype=bool)
-    else:
-        next_theta_dots, entered_roa = jax.vmap(
-            get_next_poincare_velocity_or_roa,
-            in_axes=(0, 0, None, None, None, None, None),
-        )(
-            theta_dot_grid.ravel(),
-            alpha_grid.ravel(),
-            params,
-            roa_bounds,
-            large_timestep,
-            small_timestep,
-            max_sim_time,
-        )
+    next_theta_dots, entered_roa = jax.vmap(
+        get_next_poincare_velocity_or_roa,
+        in_axes=(0, 0, None, None, None, None, None),
+    )(
+        theta_dot_grid.ravel(),
+        alpha_grid.ravel(),
+        params,
+        roa_bounds,
+        large_timestep,
+        small_timestep,
+        max_sim_time,
+    )
 
     return ReturnMapResult(
         alpha_values=alpha_values,
@@ -744,44 +668,6 @@ def compute_return_map(
             (alpha_values.size, theta_dot_values.size)
         ),
     )
-
-
-def plot_return_map(result: ReturnMapResult):
-    fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
-    color_map = plt.get_cmap("viridis")
-    color_norm = Normalize(
-        vmin=np.rad2deg(result.alpha_values[0]),
-        vmax=np.rad2deg(result.alpha_values[-1]),
-    )
-
-    theta_dot_values = np.rad2deg(result.theta_dot_values)
-    for alpha, next_theta_dots in zip(result.alpha_values, result.next_theta_dot_grid):
-        alpha_degrees = np.rad2deg(alpha)
-        ax.plot(
-            theta_dot_values,
-            np.rad2deg(next_theta_dots),
-            color=color_map(color_norm(alpha_degrees)),
-            linewidth=1.5,
-        )
-
-    velocity_max = np.nanmax(
-        [np.max(theta_dot_values), np.nanmax(np.rad2deg(result.next_theta_dot_grid))]
-    )
-    ax.plot([0.0, velocity_max], [0.0, velocity_max], "k--", label="Identity")
-    fig.colorbar(
-        plt.cm.ScalarMappable(norm=color_norm, cmap=color_map),
-        ax=ax,
-        label=r"Angle of attack $\alpha$ (deg)",
-    )
-    ax.set_xlim(0.0, velocity_max)
-    ax.set_ylim(0.0, velocity_max)
-    ax.set_title(r"Walker Return Map on $\theta=0$")
-    ax.set_xlabel(r"Current velocity $\dot{\theta}_k$ (deg/s)")
-    ax.set_ylabel(r"Next velocity $\dot{\theta}_{k+1}$ (deg/s)")
-    ax.grid(alpha=0.25)
-    ax.legend()
-
-    return fig
 
 
 def compute_steps_to_stability(
@@ -1165,6 +1051,255 @@ def create_walker_animation(
     )
 
 
+def run_trajectory(args, params, output):
+    sim_time = 3.0
+    timestep = 1e-3
+    small_timestep = 1e-4
+    num_timesteps = round(sim_time / timestep)
+    initial_state = np.array([-0.1, 3.0])
+
+    start = time.perf_counter()
+    initial_alpha = jnp.asarray(params["angle_of_attack_bounds"][0])
+    controller_name = args.controller
+    if controller_name == "standing":
+        controller = StandingController(initial_alpha)
+    elif controller_name == "minimum-alpha":
+        roa_bounds = jnp.asarray(np.load(args.roa_bounds_file, allow_pickle=False))
+        controller = MinimumAlphaController(
+            roa_bounds=roa_bounds,
+            ankle_controller_enabled=jnp.asarray(False),
+        )
+    else:
+        policy_map = np.load(args.map_file, allow_pickle=False)
+        roa_bounds = np.load(args.roa_bounds_file, allow_pickle=False)
+        # The policy is defined on the theta=0 Poincare section.
+        controller = LookupTableController(
+            policy_map=jnp.asarray(policy_map),
+            roa_bounds=jnp.asarray(roa_bounds),
+            previous_theta=jnp.asarray(initial_state[0]),
+            alpha=initial_alpha,
+            ankle_controller_enabled=jnp.asarray(False),
+            initialized=jnp.asarray(False),
+        )
+    print(f"Using {controller_name} controller.")
+    time_traj, state_traj, impacts, control_traj = simulate(
+        initial_state,
+        timestep,
+        small_timestep,
+        num_timesteps,
+        params,
+        controller,
+    )
+    jax.block_until_ready((time_traj, state_traj, impacts, control_traj))
+    end = time.perf_counter()
+    print(f"Computed trajectory in {end - start}s")
+
+    fps = 25
+    animation = create_walker_animation(
+        time_traj, state_traj, control_traj, params, timestep, fps
+    )
+    animation.save(output / "walker.gif", writer=PillowWriter(fps=fps))
+    energy_fig = plot_energy(time_traj, state_traj, impacts, params, control_traj)
+    energy_fig.savefig(output / "energy.png")
+    state_space_fig = plot_state_space(
+        state_traj,
+        impacts,
+        control_traj,
+        params,
+    )
+    state_space_fig.savefig(output / "state_space.png")
+    print(
+        f"Saved {output / 'walker.gif'}, {output / 'energy.png'}, and "
+        f"{output / 'state_space.png'}."
+    )
+
+
+def run_roa(params, output):
+    NUM_THETAS = 200
+    NUM_THETA_DOTS = 200
+    THETA_MIN = np.deg2rad(-90.0) + params["incline"]
+    THETA_MAX = params["incline"] + params["angle_of_attack_bounds"][0]
+    THETA_DOT_MIN = np.deg2rad(-100.0)
+    THETA_DOT_MAX = np.deg2rad(300.0)
+    sim_time = 10.0
+    large_timestep = 1e-2
+    small_timestep = 1e-4
+    theta_values = jnp.linspace(THETA_MIN, THETA_MAX, NUM_THETAS)
+    theta_dot_values = jnp.linspace(THETA_DOT_MIN, THETA_DOT_MAX, NUM_THETA_DOTS)
+
+    start = time.perf_counter()
+    roa_result = find_upright_roa(
+        params,
+        theta_values,
+        theta_dot_values,
+        large_timestep,
+        small_timestep,
+        sim_time,
+    )
+    jax.block_until_ready(roa_result)
+    end = time.perf_counter()
+    print(f"Computed RoA in {end - start}s")
+
+    roa_fig = plot_upright_roa(roa_result)
+    roa_path = output / "upright_roa.png"
+    roa_fig.savefig(roa_path)
+    roa_bounds_path = output / "roa_bounds.npy"
+    np.save(roa_bounds_path, get_roa_bounds(roa_result))
+    print(f"Saved {roa_path} and {roa_bounds_path}.")
+
+
+def run_lookup_table(args, params, output):
+    NUM_THETA_DOTS = 40
+    NUM_ALPHAS = 4
+    MAX_FROUDE = 2.0
+    ROA_SIM_TIME = 10.0
+    RETURN_MAP_SIM_TIME = 5.0
+    LARGE_TIMESTEP = 1e-2
+    SMALL_TIMESTEP = 1e-4
+    VALIDATION_NUM_THETA_DOTS = 2000
+    VALIDATION_TIMESTEP = 1e-4
+    VALIDATION_SIM_TIME = 10.0
+    VALIDATION_NUM_TIMESTEPS = round(VALIDATION_SIM_TIME / VALIDATION_TIMESTEP)
+
+    theta_values = jnp.array([0.0])
+    theta_dot_values = jnp.linspace(
+        0.0,
+        jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
+        NUM_THETA_DOTS,
+    )
+    alpha_values = jnp.linspace(*params["angle_of_attack_bounds"], NUM_ALPHAS)
+    STATE_MATCH_TOLERANCE = float((theta_dot_values[1] - theta_dot_values[0]) / 2)
+    roa_bounds = jnp.asarray(np.load(args.roa_bounds_file, allow_pickle=False))
+
+    start = time.perf_counter()
+    roa_result = find_upright_roa(
+        params,
+        theta_values,
+        theta_dot_values,
+        LARGE_TIMESTEP,
+        SMALL_TIMESTEP,
+        ROA_SIM_TIME,
+    )
+    return_map = compute_return_map(
+        params,
+        theta_dot_values,
+        alpha_values,
+        LARGE_TIMESTEP,
+        SMALL_TIMESTEP,
+        RETURN_MAP_SIM_TIME,
+        roa_bounds,
+    )
+    jax.block_until_ready((roa_result, return_map))
+    steps_result = compute_steps_to_stability(
+        roa_result,
+        return_map,
+        STATE_MATCH_TOLERANCE,
+    )
+    end = time.perf_counter()
+    print(f"Computed lookup table in {end - start}s")
+    print(
+        f"Reachable states: {np.count_nonzero(steps_result.steps >= 0)}/"
+        f"{steps_result.steps.size}; maximum steps: {np.max(steps_result.steps)}"
+    )
+
+    policy_map = np.column_stack(
+        (
+            steps_result.theta_dot_values,
+            steps_result.steps,
+            steps_result.alpha_values,
+        )
+    )
+    validation_theta_dot_values = jnp.linspace(
+        0.0,
+        jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
+        VALIDATION_NUM_THETA_DOTS,
+    )
+    validation_start = time.perf_counter()
+    rollout_result = validate_policy_rollouts(
+        params,
+        validation_theta_dot_values,
+        jnp.asarray(policy_map),
+        roa_bounds,
+        VALIDATION_TIMESTEP,
+        SMALL_TIMESTEP,
+        VALIDATION_NUM_TIMESTEPS,
+    )
+    jax.block_until_ready(rollout_result)
+    validation_end = time.perf_counter()
+    converged = np.asarray(rollout_result.converged)
+    fell_backward = np.asarray(rollout_result.fell_backward)
+    print(
+        f"Validated {converged.size} rollouts in "
+        f"{validation_end - validation_start}s: "
+        f"{np.count_nonzero(converged)} converged, "
+        f"{np.count_nonzero(fell_backward)} fell backward, "
+        f"{np.count_nonzero(~converged & ~fell_backward)} timed out."
+    )
+    if np.any(~converged):
+        failed_velocities = np.rad2deg(
+            np.asarray(rollout_result.theta_dot_values)[~converged]
+        )
+        print(
+            "Failed initial velocities (deg/s): "
+            f"{np.array2string(failed_velocities, precision=3)}"
+        )
+
+    steps_fig = plot_steps_to_stability(steps_result, rollout_result)
+    steps_path = output / "steps_to_stability.png"
+    steps_fig.savefig(steps_path)
+    policy_map_path = output / "policy_map.npy"
+    np.save(policy_map_path, policy_map)
+    print(f"Saved {steps_path} and {policy_map_path}.")
+
+
+def run_initial_state_steps(args, params, output):
+    NUM_THETAS = 200
+    NUM_THETA_DOTS = 800
+    MAX_FROUDE = 2.0
+    SIM_TIME = 5.0
+    TIMESTEP = 1e-2
+    SMALL_TIMESTEP = 1e-4
+    NUM_TIMESTEPS = round(SIM_TIME / TIMESTEP)
+
+    initial_alpha = params["angle_of_attack_bounds"][0]
+    theta_values = jnp.linspace(
+        params["incline"] - jnp.pi / 2,
+        params["incline"] + initial_alpha,
+        NUM_THETAS,
+    )
+    theta_dot_values = jnp.linspace(
+        jnp.deg2rad(-100.0),
+        jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
+        NUM_THETA_DOTS,
+    )
+    policy_map = jnp.asarray(np.load(args.map_file, allow_pickle=False))
+    roa_bounds = jnp.asarray(np.load(args.roa_bounds_file, allow_pickle=False))
+
+    start = time.perf_counter()
+    result = compute_initial_state_steps(
+        params,
+        theta_values,
+        theta_dot_values,
+        policy_map,
+        roa_bounds,
+        TIMESTEP,
+        SMALL_TIMESTEP,
+        NUM_TIMESTEPS,
+    )
+    jax.block_until_ready(result)
+    end = time.perf_counter()
+    print(f"Computed initial-state steps in {end - start}s")
+    print(
+        f"Simulated states: {result.steps_grid.size}; "
+        f"maximum footsteps: {np.max(result.steps_grid)}"
+    )
+
+    steps_fig = plot_initial_state_steps(result)
+    steps_path = output / "initial_state_steps.png"
+    steps_fig.savefig(steps_path)
+    print(f"Saved {steps_path}.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Simulate the inverted pendulum walker"
@@ -1194,7 +1329,6 @@ def main():
     subparsers.add_parser(
         "roa", help="plot the upright controller's region of attraction"
     )
-    subparsers.add_parser("return-map", help="plot the theta=0 Poincare return map")
     lookup_table_parser = subparsers.add_parser(
         "lookup-table",
         help="compute minimum steps to the ankle controller's RoA and save the optimal alphas",
@@ -1235,277 +1369,13 @@ def main():
     output = Path("output/assignment_2")
     output.mkdir(parents=True, exist_ok=True)
 
-    if args.command == "trajectory":
-        sim_time = 3.0
-        timestep = 1e-3
-        small_timestep = 1e-4
-        num_timesteps = round(sim_time / timestep)
-        initial_state = np.array([-0.1, 3.0])
-
-        start = time.perf_counter()
-        initial_alpha = jnp.asarray(params["angle_of_attack_bounds"][0])
-        controller_name = args.controller
-        if controller_name == "standing":
-            controller = StandingController(initial_alpha)
-        elif controller_name == "minimum-alpha":
-            roa_bounds = jnp.asarray(np.load(args.roa_bounds_file, allow_pickle=False))
-            controller = MinimumAlphaController(
-                roa_bounds=roa_bounds,
-                ankle_controller_enabled=jnp.asarray(False),
-            )
-        else:
-            policy_map = np.load(args.map_file, allow_pickle=False)
-            roa_bounds = np.load(args.roa_bounds_file, allow_pickle=False)
-            # The policy is defined on the theta=0 Poincare section.
-            controller = LookupTableController(
-                policy_map=jnp.asarray(policy_map),
-                roa_bounds=jnp.asarray(roa_bounds),
-                previous_theta=jnp.asarray(initial_state[0]),
-                alpha=initial_alpha,
-                ankle_controller_enabled=jnp.asarray(False),
-                initialized=jnp.asarray(False),
-            )
-        print(f"Using {controller_name} controller.")
-        time_traj, state_traj, impacts, control_traj = simulate(
-            initial_state,
-            timestep,
-            small_timestep,
-            num_timesteps,
-            params,
-            controller,
-        )
-        jax.block_until_ready((time_traj, state_traj, impacts, control_traj))
-        end = time.perf_counter()
-        print(f"Computed trajectory in {end - start}s")
-
-        fps = 25
-        animation = create_walker_animation(
-            time_traj, state_traj, control_traj, params, timestep, fps
-        )
-        animation.save(output / "walker.gif", writer=PillowWriter(fps=fps))
-        energy_fig = plot_energy(time_traj, state_traj, impacts, params, control_traj)
-        energy_fig.savefig(output / "energy.png")
-        state_space_fig = plot_state_space(
-            state_traj,
-            impacts,
-            control_traj,
-            params,
-        )
-        state_space_fig.savefig(output / "state_space.png")
-        print(
-            f"Saved {output / 'walker.gif'}, {output / 'energy.png'}, and "
-            f"{output / 'state_space.png'}."
-        )
-    elif args.command == "roa":
-        NUM_THETAS = 200
-        NUM_THETA_DOTS = 200
-        THETA_MIN = np.deg2rad(-90.0) + params["incline"]
-        THETA_MAX = params["incline"] + params["angle_of_attack_bounds"][0]
-        THETA_DOT_MIN = np.deg2rad(-100.0)
-        THETA_DOT_MAX = np.deg2rad(300.0)
-        sim_time = 10.0
-        large_timestep = 1e-2
-        small_timestep = 1e-4
-        theta_values = jnp.linspace(THETA_MIN, THETA_MAX, NUM_THETAS)
-        theta_dot_values = jnp.linspace(THETA_DOT_MIN, THETA_DOT_MAX, NUM_THETA_DOTS)
-
-        start = time.perf_counter()
-        roa_result = find_upright_roa(
-            params,
-            theta_values,
-            theta_dot_values,
-            large_timestep,
-            small_timestep,
-            sim_time,
-        )
-        jax.block_until_ready(roa_result)
-        end = time.perf_counter()
-        print(f"Computed RoA in {end - start}s")
-
-        roa_fig = plot_upright_roa(roa_result)
-        roa_path = output / "upright_roa.png"
-        roa_fig.savefig(roa_path)
-        roa_bounds_path = output / "roa_bounds.npy"
-        np.save(roa_bounds_path, get_roa_bounds(roa_result))
-        print(f"Saved {roa_path} and {roa_bounds_path}.")
-    elif args.command == "return-map":
-        NUM_ALPHAS = 20
-        NUM_THETA_DOTS = 200
-        MAX_FROUDE = 2.0
-        sim_time = 5.0
-        large_timestep = 1e-2
-        small_timestep = 1e-4
-        alpha_values = jnp.linspace(*params["angle_of_attack_bounds"], NUM_ALPHAS)
-        theta_dot_values = jnp.linspace(
-            0.0,
-            jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
-            NUM_THETA_DOTS,
-        )
-
-        start = time.perf_counter()
-        return_map = compute_return_map(
-            params,
-            theta_dot_values,
-            alpha_values,
-            large_timestep,
-            small_timestep,
-            sim_time,
-        )
-        jax.block_until_ready(return_map)
-        end = time.perf_counter()
-        print(f"Computed return map in {end - start}s")
-
-        return_map_fig = plot_return_map(return_map)
-        return_map_fig.savefig(output / "return_map.png")
-        print(f"Saved {output / 'return_map.png'}.")
-    elif args.command == "lookup-table":
-        NUM_THETA_DOTS = 40
-        NUM_ALPHAS = 4
-        MAX_FROUDE = 2.0
-        ROA_SIM_TIME = 10.0
-        RETURN_MAP_SIM_TIME = 5.0
-        LARGE_TIMESTEP = 1e-2
-        SMALL_TIMESTEP = 1e-4
-        VALIDATION_NUM_THETA_DOTS = 2000
-        VALIDATION_TIMESTEP = 1e-4
-        VALIDATION_SIM_TIME = 10.0
-        VALIDATION_NUM_TIMESTEPS = round(VALIDATION_SIM_TIME / VALIDATION_TIMESTEP)
-
-        theta_values = jnp.array([0.0])
-        theta_dot_values = jnp.linspace(
-            0.0,
-            jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
-            NUM_THETA_DOTS,
-        )
-        alpha_values = jnp.linspace(*params["angle_of_attack_bounds"], NUM_ALPHAS)
-        STATE_MATCH_TOLERANCE = float((theta_dot_values[1] - theta_dot_values[0]) / 2)
-        roa_bounds = jnp.asarray(np.load(args.roa_bounds_file, allow_pickle=False))
-
-        start = time.perf_counter()
-        roa_result = find_upright_roa(
-            params,
-            theta_values,
-            theta_dot_values,
-            LARGE_TIMESTEP,
-            SMALL_TIMESTEP,
-            ROA_SIM_TIME,
-        )
-        return_map = compute_return_map(
-            params,
-            theta_dot_values,
-            alpha_values,
-            LARGE_TIMESTEP,
-            SMALL_TIMESTEP,
-            RETURN_MAP_SIM_TIME,
-            roa_bounds,
-        )
-        jax.block_until_ready((roa_result, return_map))
-        steps_result = compute_steps_to_stability(
-            roa_result,
-            return_map,
-            STATE_MATCH_TOLERANCE,
-        )
-        end = time.perf_counter()
-        print(f"Computed lookup table in {end - start}s")
-        print(
-            f"Reachable states: {np.count_nonzero(steps_result.steps >= 0)}/"
-            f"{steps_result.steps.size}; maximum steps: {np.max(steps_result.steps)}"
-        )
-
-        policy_map = np.column_stack(
-            (
-                steps_result.theta_dot_values,
-                steps_result.steps,
-                steps_result.alpha_values,
-            )
-        )
-        validation_theta_dot_values = jnp.linspace(
-            0.0,
-            jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
-            VALIDATION_NUM_THETA_DOTS,
-        )
-        validation_start = time.perf_counter()
-        rollout_result = validate_policy_rollouts(
-            params,
-            validation_theta_dot_values,
-            jnp.asarray(policy_map),
-            roa_bounds,
-            VALIDATION_TIMESTEP,
-            SMALL_TIMESTEP,
-            VALIDATION_NUM_TIMESTEPS,
-        )
-        jax.block_until_ready(rollout_result)
-        validation_end = time.perf_counter()
-        converged = np.asarray(rollout_result.converged)
-        fell_backward = np.asarray(rollout_result.fell_backward)
-        print(
-            f"Validated {converged.size} rollouts in "
-            f"{validation_end - validation_start}s: "
-            f"{np.count_nonzero(converged)} converged, "
-            f"{np.count_nonzero(fell_backward)} fell backward, "
-            f"{np.count_nonzero(~converged & ~fell_backward)} timed out."
-        )
-        if np.any(~converged):
-            failed_velocities = np.rad2deg(
-                np.asarray(rollout_result.theta_dot_values)[~converged]
-            )
-            print(
-                "Failed initial velocities (deg/s): "
-                f"{np.array2string(failed_velocities, precision=3)}"
-            )
-
-        steps_fig = plot_steps_to_stability(steps_result, rollout_result)
-        steps_path = output / "steps_to_stability.png"
-        steps_fig.savefig(steps_path)
-        policy_map_path = output / "policy_map.npy"
-        np.save(policy_map_path, policy_map)
-        print(f"Saved {steps_path} and {policy_map_path}.")
-    elif args.command == "initial-state-steps":
-        NUM_THETAS = 200
-        NUM_THETA_DOTS = 800
-        MAX_FROUDE = 2.0
-        SIM_TIME = 5.0
-        TIMESTEP = 1e-2
-        SMALL_TIMESTEP = 1e-4
-        NUM_TIMESTEPS = round(SIM_TIME / TIMESTEP)
-
-        initial_alpha = params["angle_of_attack_bounds"][0]
-        theta_values = jnp.linspace(
-            params["incline"] - jnp.pi / 2,
-            params["incline"] + initial_alpha,
-            NUM_THETAS,
-        )
-        theta_dot_values = jnp.linspace(
-            jnp.deg2rad(-100.0),
-            jnp.sqrt(MAX_FROUDE * params["gravity"] / params["length"]),
-            NUM_THETA_DOTS,
-        )
-        policy_map = jnp.asarray(np.load(args.map_file, allow_pickle=False))
-        roa_bounds = jnp.asarray(np.load(args.roa_bounds_file, allow_pickle=False))
-
-        start = time.perf_counter()
-        result = compute_initial_state_steps(
-            params,
-            theta_values,
-            theta_dot_values,
-            policy_map,
-            roa_bounds,
-            TIMESTEP,
-            SMALL_TIMESTEP,
-            NUM_TIMESTEPS,
-        )
-        jax.block_until_ready(result)
-        end = time.perf_counter()
-        print(f"Computed initial-state steps in {end - start}s")
-        print(
-            f"Simulated states: {result.steps_grid.size}; "
-            f"maximum footsteps: {np.max(result.steps_grid)}"
-        )
-
-        steps_fig = plot_initial_state_steps(result)
-        steps_path = output / "initial_state_steps.png"
-        steps_fig.savefig(steps_path)
-        print(f"Saved {steps_path}.")
+    command_functions = {
+        "trajectory": lambda: run_trajectory(args, params, output),
+        "roa": lambda: run_roa(params, output),
+        "lookup-table": lambda: run_lookup_table(args, params, output),
+        "initial-state-steps": lambda: run_initial_state_steps(args, params, output),
+    }
+    command_functions[args.command]()
 
     plt.show()
 
