@@ -1,7 +1,7 @@
 # Assignment 2
 
-**PR opening deadline:** Thursday, September 17th, 11:59PM (midnight)
-**First Code Review deadline:** Sunday, September 20th, 11:59PM (midnight)
+**PR opening deadline:** Thursday, September 17th, 11:59PM (midnight)  
+**First Code Review deadline:** Sunday, September 20th, 11:59PM (midnight)  
 **Report Submission deadline:** Wednesday, September 23rd, 11:59 (midnight)
 
 You should open a PR to your own `main` branch with a clear title to make it easy to find. Your peer code-reviewing assignment will be posted on Canvas: go find the and give the code review by the code review deadline. You are encouraged to take the initiative and communicate actively with your reviewer, and your reviewee; e.g. if you are ready for a review before the deadline, let your reviewer know.

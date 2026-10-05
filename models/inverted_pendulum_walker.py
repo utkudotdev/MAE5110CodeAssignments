@@ -10,10 +10,12 @@ import numpy as np
 
 
 def generate_params():
-    pass
+    return {"mass": 1.0, "gravity": 9.81, "length": 1.0, "incline": 0.1}
 
+def generate_initial_condition():
+    return jnp.array([0.0, 0.0])
 
-def dynamics(t, state, control, params):
+def dynamics(t, state, params, control=(0.0, 0.0)):
     m = params["mass"]
     g = params["gravity"]
     l = params["length"]

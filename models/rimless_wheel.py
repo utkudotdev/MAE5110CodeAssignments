@@ -55,6 +55,12 @@ def generate_params():
     }
     return params
 
+def generate_initial_condition():
+    return np.array([0.0, 0.0])
+
+
+def dynamics(t, state, params):
+    return swing_dynamics(state, params)
 
 def calculate_angular_momentum(states: npt.NDArray, params):
     mass = params["mass"]

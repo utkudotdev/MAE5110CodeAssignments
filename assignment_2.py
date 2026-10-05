@@ -189,9 +189,9 @@ def simulation_step(time, state, control, timestep, small_timestep, params):
 
     At most one impact is supported within a timestep.
     """
-    dynamics = ft.partial(model.dynamics, control=control, params=params)
+    dynamics = ft.partial(model.dynamics, control=control)
 
-    full_step_state = rk4(dynamics, time, state, timestep)
+    full_step_state = rk4(dynamics, time, state, timestep, params)
     full_step_collision = model.event_guard(state, full_step_state, control, params)
 
     def refine_collision():
@@ -202,7 +202,7 @@ def simulation_step(time, state, control, timestep, small_timestep, params):
         def take_small_step(carry):
             current_state, elapsed, _ = carry
             step_size = jnp.minimum(small_timestep, timestep - elapsed)
-            next_state = rk4(dynamics, time + elapsed, current_state, step_size)
+            next_state = rk4(dynamics, time + elapsed, current_state, step_size, params)
             collision_occurred = model.event_guard(
                 current_state, next_state, control, params
             )
@@ -220,7 +220,7 @@ def simulation_step(time, state, control, timestep, small_timestep, params):
         )
 
         remaining_time = timestep - elapsed
-        end_state = rk4(dynamics, time + elapsed, impact_state, remaining_time)
+        end_state = rk4(dynamics, time + elapsed, impact_state, remaining_time, params)
         return end_state, collision_occurred
 
     return jax.lax.cond(
@@ -564,7 +564,7 @@ def get_next_poincare_velocity_or_roa(
         def take_small_step(carry):
             current_state, elapsed = carry
             step_size = jnp.minimum(small_timestep, timestep - elapsed)
-            next_state = rk4(dynamics, time + elapsed, current_state, step_size)
+            next_state = rk4(dynamics, time + elapsed, current_state, step_size, params)
             return next_state, elapsed + step_size
 
         crossing_state, _ = jax.lax.while_loop(
